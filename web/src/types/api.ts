@@ -49,6 +49,7 @@ export interface Video {
   mime_type: string;
   state: 'uploading' | 'validating' | 'processing' | 'indexed' | 'failed' | 'deleted';
   error_text?: string;
+  thumbnail_url?: string;
   created_at: string;
   indexed_at?: string;
 }

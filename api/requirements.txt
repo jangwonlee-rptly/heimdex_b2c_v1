@@ -46,6 +46,9 @@ structlog>=23.2.0,<24.0.0
 # HTTP client
 httpx>=0.25.0,<1.0.0
 
+# Basic ML support (for embeddings API)
+numpy>=1.26.0,<2.0.0
+
 # Development
 pytest>=7.4.0,<8.0.0
 pytest-asyncio>=0.21.0,<1.0.0

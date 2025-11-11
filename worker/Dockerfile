@@ -24,13 +24,16 @@ RUN apt-get update && apt-get install -y \
 # Create app directory
 WORKDIR /app
 
+# Copy shared code (model client) first
+COPY shared/ /app/shared/
+
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
+COPY worker/requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY worker/ .
 
 # Create directories for temporary files
 RUN mkdir -p /tmp/heimdex && \

@@ -1,0 +1,476 @@
+================================================================================
+DEVLOG: Model Loading Architecture Analysis & Optimization Strategy
+================================================================================
+Date: 2025-11-11 13:48
+Session: Analyzing inefficient model loading and proposing production-grade solution
+Status: Analysis Complete - Awaiting Implementation Decision
+
+================================================================================
+CURRENT ARCHITECTURE PROBLEMS
+================================================================================
+
+1. **Multiple Model Loads (Memory Waste)**
+
+   Worker Container (video_processor.py:39-97):
+   - Runs with `--processes 2 --threads 4` (line 241 docker-compose.yml)
+   - Each process loads models independently via lazy loading
+   - Global `_models` dict is per-process, NOT shared across processes
+   - Result: 2x Whisper + 2x BGE-M3 + 2x SigLIP in memory
+
+   API Container (search/embeddings.py:20-57):
+   - Separate process from worker
+   - Also loads SigLIP for text queries
+   - Result: 3x SigLIP total across system
+
+   **Total Memory Waste:**
+   - Whisper medium: 3GB × 2 processes = 6GB
+   - BGE-M3: 2GB × 2 processes = 4GB
+   - SigLIP: 1.5GB × 3 (2 worker + 1 API) = 4.5GB
+   - YuNet: 5MB (negligible)
+   - **TOTAL: ~14.5GB for what should be ~6.5GB**
+   - Worker limit is 12GB - we're already over!
+
+2. **Lazy Loading on First Request**
+
+   Both API and worker use lazy loading:
+   ```python
+   if model_name not in _models:
+       # Load model here (slow!)
+   ```
+
+   Problems:
+   - First request experiences 2-5 second delay
+   - Cold start on every container restart
+   - No health check verification
+   - Users see timeouts
+
+3. **No Model Warmup or Kernel Compilation**
+
+   PyTorch/CUDA kernels compile on first use:
+   - First inference: ~500-2000ms (compilation)
+   - Subsequent inferences: ~100-200ms
+   - Every restart = new compilation
+
+4. **Missing Dependencies**
+
+   Currently experiencing:
+   - Missing torchvision (FIXED in this session)
+   - Missing sentencepiece (CURRENT ISSUE)
+   - Pattern: Dependencies not validated until runtime
+
+5. **Inefficient Worker Configuration**
+
+   Command: `dramatiq ... --processes 2 --threads 4`
+   - 2 processes × all models = 2x memory
+   - Threads don't help with CPU-bound ML (GIL)
+   - No task specialization (all workers do everything)
+
+================================================================================
+MEMORY ANALYSIS
+================================================================================
+
+Current Observed Usage (docker stats):
+- Worker: 1.04GB / 12GB (models not loaded yet!)
+- API: 630MB / unlimited
+- Total: ~1.7GB baseline
+
+Expected After Full Load:
+- Worker Process 1: 6.5GB (Whisper + BGE + SigLIP + YuNet)
+- Worker Process 2: 6.5GB (duplicate load)
+- API: 1.5GB (SigLIP)
+- **TOTAL: 14.5GB** (exceeds worker limit!)
+
+Model Size Breakdown:
+```
+Whisper medium:
+  - Encoder: ~1.5GB
+  - Decoder: ~1.5GB
+  - Total: ~3GB
+
+BGE-M3 (BAAI/bge-m3):
+  - Model: ~1.7GB
+  - Tokenizer: ~100MB
+  - FP16 mode: ~2GB total
+
+SigLIP (google/siglip-so400m-patch14-384):
+  - Vision encoder: ~600MB
+  - Text encoder: ~500MB
+  - Processor: ~100MB
+  - Total: ~1.2-1.5GB
+
+YuNet:
+  - ONNX model: ~5MB
+  - Runtime overhead: ~50MB
+```
+
+================================================================================
+PROPOSED SOLUTION: HYBRID MODEL SERVICE ARCHITECTURE
+================================================================================
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Model Service Container                  │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐            │
+│  │  Whisper   │  │   SigLIP   │  │  BGE-M3   │  ┌────────┐ │
+│  │  (3GB)     │  │  (1.5GB)   │  │   (2GB)   │  │ YuNet  │ │
+│  └─────┬──────┘  └─────┬──────┘  └─────┬─────┘  └───┬────┘ │
+│        │               │               │             │      │
+│  ┌─────▼───────────────▼───────────────▼─────────────▼───┐  │
+│  │          FastAPI Server (localhost:8001)             │  │
+│  │  /asr/transcribe   /embed/text   /embed/vision       │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ HTTP (localhost only)
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+  ┌───────▼────────┐  ┌───────▼────────┐  ┌──────▼─────────┐
+  │  API Container │  │ Worker-Vision  │  │  Worker-Index  │
+  │  (Lightweight) │  │ (Scene + Face) │  │ (ASR + Embed)  │
+  └────────────────┘  └────────────────┘  └────────────────┘
+```
+
+## Benefits
+
+1. **Single Model Load** (6.5GB total, not 14.5GB)
+   - All models loaded once in model-service
+   - API and workers call HTTP endpoints
+   - 55% memory reduction
+
+2. **Preloading & Warmup**
+   - Models load on container start
+   - Health check verifies readiness
+   - First user request is fast
+
+3. **Specialized Workers**
+   - worker-vision: Scene detection + face processing
+   - worker-indexing: ASR + text embedding
+   - Each only loads what it needs (if any)
+
+4. **Production-Ready Patterns**
+   - Easy monitoring (single endpoint)
+   - Can add request queuing
+   - Can add GPU batching later
+   - Standard observability
+
+5. **Horizontal Scaling**
+   - Model service can run on GPU node
+   - Workers can scale on CPU nodes
+   - API can scale independently
+
+================================================================================
+ALTERNATIVE SOLUTION: OPTIMIZED IN-PROCESS LOADING
+================================================================================
+
+If you prefer NO model service (simpler but less scalable):
+
+## Option B: Single-Process Workers + Preloading
+
+Changes:
+1. Worker: `--processes 1 --threads 8` (single process)
+2. Worker: Preload models on startup (not lazy)
+3. API: Call worker endpoints instead of loading SigLIP
+4. Separate worker types for specialization
+
+Benefits:
+- Simple (no new service)
+- Lower latency (no HTTP)
+- Shared memory via single process
+
+Drawbacks:
+- Workers block each other (CPU-bound)
+- Can't scale models independently
+- Harder to monitor/debug
+
+================================================================================
+RECOMMENDED APPROACH
+================================================================================
+
+**Phase 1: Quick Wins (Immediate)**
+1. Fix missing dependencies (sentencepiece)
+2. Change worker to `--processes 1` (avoid duplicate loads)
+3. Add model preloading on startup
+4. Verify memory usage drops to ~7GB
+
+**Phase 2: Model Service (Production)**
+1. Create `model-service` container with FastAPI
+2. Load all models on startup with warmup
+3. Expose endpoints: /asr, /embed/text, /embed/vision, /face/detect
+4. Update API and workers to call model-service
+5. Remove model loading from API and workers
+
+**Phase 3: Specialization (Scale)**
+1. Split workers: worker-vision, worker-indexing
+2. Add GPU batching to model-service
+3. Add request queuing and rate limiting
+4. Production observability
+
+================================================================================
+IMPLEMENTATION DETAILS: MODEL SERVICE
+================================================================================
+
+File: model-service/app/main.py
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import torch
+from transformers import AutoProcessor, AutoModel
+import whisper
+from FlagEmbedding import FlagModel
+import cv2
+import numpy as np
+from PIL import Image
+import io
+import base64
+
+app = FastAPI(title="Heimdex Model Service")
+
+# Global models (loaded on startup)
+models = {}
+
+@app.on_event("startup")
+async def load_models():
+    """Preload all models with warmup."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Load Whisper
+    print("[models] Loading Whisper medium...")
+    models["whisper"] = whisper.load_model("medium", device=device)
+
+    # Load SigLIP
+    print("[models] Loading SigLIP...")
+    processor = AutoProcessor.from_pretrained("google/siglip-so400m-patch14-384")
+    model = AutoModel.from_pretrained("google/siglip-so400m-patch14-384")
+    models["siglip"] = {"model": model.to(device), "processor": processor}
+
+    # Load BGE-M3
+    print("[models] Loading BGE-M3...")
+    models["bge"] = FlagModel("BAAI/bge-m3", use_fp16=(device=="cuda"))
+
+    # Load YuNet
+    print("[models] Loading YuNet...")
+    models["yunet"] = cv2.FaceDetectorYN.create(...)
+
+    # Warmup (compile kernels)
+    print("[models] Warming up models...")
+    _ = models["siglip"]["model"].get_text_features(
+        **models["siglip"]["processor"](text=["test"], return_tensors="pt")
+    )
+    print("[models] All models ready!")
+
+class TextEmbedRequest(BaseModel):
+    text: str
+
+@app.post("/embed/text")
+async def embed_text(req: TextEmbedRequest):
+    """Generate text embedding with SigLIP."""
+    try:
+        processor = models["siglip"]["processor"]
+        model = models["siglip"]["model"]
+
+        inputs = processor(text=[req.text], return_tensors="pt", padding=True)
+        with torch.no_grad():
+            outputs = model.get_text_features(**inputs)
+
+        embedding = outputs[0].cpu().numpy().tolist()
+        return {"embedding": embedding, "dimension": len(embedding)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health():
+    """Health check - verify all models loaded."""
+    return {
+        "status": "healthy",
+        "models_loaded": list(models.keys()),
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
+    }
+```
+
+File: docker-compose.yml additions
+```yaml
+  model-service:
+    build:
+      context: ./model-service
+      dockerfile: Dockerfile
+    container_name: heimdex-model-service
+    environment:
+      HF_HOME: /app/models/.cache
+      CUDA_VISIBLE_DEVICES: "0"
+    ports:
+      - "8001:8001"  # Internal only in production
+    volumes:
+      - models_cache:/app/models
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - heimdex
+```
+
+================================================================================
+MIGRATION PLAN
+================================================================================
+
+**Step 1: Fix Immediate Issues (Now)**
+```bash
+# Add missing dependency
+echo "sentencepiece>=0.1.99,<1.0.0" >> api/requirements.txt
+echo "sentencepiece>=0.1.99,<1.0.0" >> worker/requirements.txt
+
+# Reduce worker processes
+# In docker-compose.yml line 241:
+# OLD: --processes 2 --threads 4
+# NEW: --processes 1 --threads 8
+
+# Rebuild
+docker compose up -d --build api worker
+```
+
+**Step 2: Add Preloading (Week 1)**
+```python
+# In worker/tasks/video_processor.py
+def preload_models():
+    """Load all models on startup."""
+    print("[worker] Preloading models...")
+    get_model("whisper")
+    get_model("bge-m3")
+    get_model("siglip")
+    get_model("yunet")
+    print("[worker] Preload complete!")
+
+# Call in module initialization
+preload_models()
+```
+
+**Step 3: Model Service (Week 2)**
+- Create model-service directory
+- Implement FastAPI endpoints
+- Update docker-compose.yml
+- Migrate API to use model-service
+- Migrate workers to use model-service
+
+**Step 4: Specialized Workers (Week 3)**
+- Split dramatiq actors by task type
+- Create separate worker containers
+- Route tasks to specialized queues
+
+================================================================================
+COST-BENEFIT ANALYSIS
+================================================================================
+
+Current State:
+- Memory: 14.5GB (over limit!)
+- Cold start: 2-5 seconds
+- Complexity: Medium
+- Scalability: Poor
+
+After Phase 1 (Quick Wins):
+- Memory: 7GB (under limit ✓)
+- Cold start: 0 seconds (preloaded)
+- Complexity: Low
+- Scalability: Poor
+- **Effort: 30 minutes**
+
+After Phase 2 (Model Service):
+- Memory: 7GB (optimal ✓)
+- Cold start: 0 seconds ✓
+- Complexity: Medium
+- Scalability: Excellent ✓
+- Monitoring: Easy ✓
+- **Effort: 4-6 hours**
+
+After Phase 3 (Specialized):
+- Memory: Optimal per service
+- Latency: 50-100ms (batching)
+- Complexity: High
+- Scalability: Production-grade ✓
+- **Effort: 8-12 hours**
+
+================================================================================
+DECISION REQUIRED
+================================================================================
+
+Please choose your preferred approach:
+
+**Option A: Quick Win Only** (30 min)
+- Fix sentencepiece
+- Single process worker
+- Preload models
+- Good for: MVP, early development
+
+**Option B: Model Service** (6 hours)
+- All of Option A
+- Dedicated model service
+- HTTP-based inference
+- Good for: Production deployment
+
+**Option C: Full Production** (16 hours)
+- All of Option B
+- Specialized workers
+- GPU batching
+- Full observability
+- Good for: Scale, optimization
+
+================================================================================
+RECOMMENDED IMMEDIATE ACTIONS
+================================================================================
+
+1. **Fix sentencepiece** (5 min)
+   ```bash
+   echo "sentencepiece>=0.1.99,<1.0.0" >> api/requirements.txt
+   docker compose up -d --build api
+   ```
+
+2. **Reduce worker processes** (2 min)
+   ```yaml
+   # docker-compose.yml line 241
+   command: dramatiq tasks.video_processor tasks.face_processor tasks.indexing tasks.asr tasks.vision tasks.faces --processes 1 --threads 8
+   ```
+
+3. **Add preloading** (15 min)
+   - Modify worker to preload on startup
+   - Verify memory usage ~7GB
+   - Test search functionality
+
+4. **Monitor and decide** (ongoing)
+   - Watch memory usage over time
+   - Measure request latency
+   - Decide if model service is needed
+
+================================================================================
+QUESTIONS FOR USER
+================================================================================
+
+1. **Immediate priority**: Just fix current issues or implement better architecture?
+2. **Timeline**: Need production-ready now or can iterate?
+3. **Scale**: How many concurrent users expected?
+4. **GPU**: Will you have dedicated GPU nodes in production?
+5. **Deployment**: Single node or multi-node Kubernetes?
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+Waiting for user input on preferred approach. Meanwhile, fixing:
+1. ✓ Added torchvision to requirements.txt
+2. ⏳ Adding sentencepiece to requirements.txt
+3. ⏳ API container rebuilding
+
+================================================================================
+END OF ANALYSIS
+================================================================================

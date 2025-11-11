@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     # Bucket names
     storage_bucket_uploads: str = "uploads"
     storage_bucket_sidecars: str = "sidecars"
+    storage_bucket_thumbnails: str = "thumbnails"
     storage_bucket_tmp: str = "tmp"
 
     # Supabase Authentication
@@ -86,7 +87,16 @@ class Settings(BaseSettings):
     feature_vision: bool = True
     feature_face: bool = False
     feature_face_licensed: bool = False
+    feature_face_enrollment: bool = False  # Enable people profile photo upload
+    feature_face_detection: bool = False  # Enable face detection in video processing
+    feature_semantic_search: bool = False  # Enable vector similarity search
     feature_email_verification: bool = False
+
+    # Systems-level feature flags for search quality
+    feature_search_sys_ann_tuning: bool = False  # Enable HNSW indexes and tuned ANN params
+    feature_search_sys_hybrid_rrf: bool = False  # Enable BM25 + vector RRF fusion
+    feature_search_sys_canonical_trim: bool = False  # Enable text normalization before embedding
+    feature_search_sys_eval: bool = False  # Enable search metrics and golden query evaluation
 
     # ML Models
     asr_model: Literal["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "turbo"] = "medium"
@@ -124,6 +134,20 @@ class Settings(BaseSettings):
     search_tag_weight: float = 0.15
     search_person_boost: float = 0.3
     signed_url_expire_seconds: int = 600  # 10 minutes
+
+    # ANN Search Tuning (FEATURE_SEARCH_SYS_ANN_TUNING)
+    search_ann_ef_search: int = 100  # HNSW query breadth (higher = better recall, slower)
+    search_ann_client_topk: int = 200  # Fetch N candidates for re-ranking (topK before fusion)
+    search_ann_final_limit: int = 20  # Final results after re-ranking
+
+    # Hybrid Search - RRF Fusion (FEATURE_SEARCH_SYS_HYBRID_RRF)
+    search_hybrid_bm25_weight: float = 0.3  # BM25 sparse retrieval weight
+    search_hybrid_vector_weight: float = 0.7  # Vector dense retrieval weight
+    search_hybrid_rrf_k: int = 60  # RRF constant (typical range: 20-100)
+
+    # Canonical Text Normalization (FEATURE_SEARCH_SYS_CANONICAL_TRIM)
+    search_canonical_max_tokens: int = 512  # Max tokens before embedding
+    search_canonical_field_order: str = "transcript,tags,persons"  # Field priority for text
 
     # Observability
     log_level: str = "INFO"

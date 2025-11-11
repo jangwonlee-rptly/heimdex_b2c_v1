@@ -15,6 +15,7 @@ from app.db import get_db
 from app.logging_config import logger
 from app.models.video import Video, VideoState
 from app.models.job import Job, JobStage, JobState
+from app.models.scene import Scene
 from app.storage import StorageClient
 
 router = APIRouter()
@@ -53,6 +54,7 @@ class VideoResponse(BaseModel):
     duration_s: Optional[float]
     state: str
     error_text: Optional[str]
+    thumbnail_url: Optional[str]
     created_at: str
     indexed_at: Optional[str]
 
@@ -254,6 +256,7 @@ async def list_videos(
     List all videos for the authenticated user.
 
     Returns videos ordered by creation date (newest first).
+    Includes thumbnail URL from the first scene of each video.
     """
     # Get total count
     from sqlalchemy import func as sql_func
@@ -272,6 +275,51 @@ async def list_videos(
     result = await db.execute(stmt)
     videos = result.scalars().all()
 
+    # Get first scene thumbnail for each video
+    video_ids = [v.video_id for v in videos]
+    thumbnail_map = {}
+
+    if video_ids:
+        # Subquery to get the minimum start_s for each video
+        from sqlalchemy import func as sql_func
+        min_start_subq = (
+            select(
+                Scene.video_id,
+                sql_func.min(Scene.start_s).label('min_start')
+            )
+            .where(
+                Scene.video_id.in_(video_ids),
+                Scene.thumbnail_key.isnot(None)
+            )
+            .group_by(Scene.video_id)
+            .subquery()
+        )
+
+        # Get the first scene for each video
+        scenes_stmt = (
+            select(Scene)
+            .join(
+                min_start_subq,
+                (Scene.video_id == min_start_subq.c.video_id) &
+                (Scene.start_s == min_start_subq.c.min_start)
+            )
+        )
+        scenes_result = await db.execute(scenes_stmt)
+        scenes = scenes_result.scalars().all()
+
+        # Generate presigned URLs for thumbnails
+        for scene in scenes:
+            if scene.thumbnail_key:
+                try:
+                    thumbnail_url = StorageClient.generate_presigned_download_url(
+                        bucket=settings.storage_bucket_thumbnails,
+                        object_key=scene.thumbnail_key,
+                        expires=timedelta(hours=1)
+                    )
+                    thumbnail_map[scene.video_id] = thumbnail_url
+                except Exception as e:
+                    logger.warning(f"Failed to generate thumbnail URL for video {scene.video_id}: {e}")
+
     return VideoListResponse(
         videos=[
             VideoResponse(
@@ -284,6 +332,7 @@ async def list_videos(
                 duration_s=float(v.duration_s) if v.duration_s else None,
                 state=v.state,
                 error_text=v.error_text,
+                thumbnail_url=thumbnail_map.get(v.video_id),
                 created_at=v.created_at.isoformat(),
                 indexed_at=v.indexed_at.isoformat() if v.indexed_at else None,
             )
@@ -313,6 +362,30 @@ async def get_video(
             detail="Video not found"
         )
 
+    # Get first scene thumbnail
+    thumbnail_url = None
+    first_scene_stmt = (
+        select(Scene)
+        .where(
+            Scene.video_id == video.video_id,
+            Scene.thumbnail_key.isnot(None)
+        )
+        .order_by(Scene.start_s)
+        .limit(1)
+    )
+    first_scene_result = await db.execute(first_scene_stmt)
+    first_scene = first_scene_result.scalar_one_or_none()
+
+    if first_scene and first_scene.thumbnail_key:
+        try:
+            thumbnail_url = StorageClient.generate_presigned_download_url(
+                bucket=settings.storage_bucket_thumbnails,
+                object_key=first_scene.thumbnail_key,
+                expires=timedelta(hours=1)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to generate thumbnail URL for video {video.video_id}: {e}")
+
     return VideoResponse(
         video_id=str(video.video_id),
         user_id=str(video.user_id),
@@ -323,6 +396,7 @@ async def get_video(
         duration_s=float(video.duration_s) if video.duration_s else None,
         state=video.state,
         error_text=video.error_text,
+        thumbnail_url=thumbnail_url,
         created_at=video.created_at.isoformat(),
         indexed_at=video.indexed_at.isoformat() if video.indexed_at else None,
     )

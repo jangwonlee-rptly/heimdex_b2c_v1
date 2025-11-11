@@ -16,7 +16,7 @@ from app.logging_config import logger
 from app.auth.routes import router as auth_router
 from app.video.routes import router as video_router
 from app.search.routes import router as search_router
-# from app.people.routes import router as people_router
+from app.people.routes import router as people_router
 
 
 @asynccontextmanager
@@ -126,7 +126,7 @@ if settings.enable_prometheus:
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
 app.include_router(video_router, prefix="/videos", tags=["Videos"])
 app.include_router(search_router, prefix="/search", tags=["Search"])
-# app.include_router(people_router, prefix="/people", tags=["People"])
+app.include_router(people_router, prefix="/people", tags=["People"])
 
 
 if __name__ == "__main__":

@@ -1,16 +1,42 @@
-# Heimdex B2C .gitignore
+# ==========================================
+# HEIMDEX B2C - .gitignore
+# Video indexing platform with API, Worker, Web, and Model Service
+# ==========================================
 
-# Environment variables
+# ==========================================
+# ENVIRONMENT & SECRETS
+# ==========================================
 .env
-.env.local
-.env.*.local
-.env.production
+.env.*
+!.env.example
+.envrc
 
-# Python
+# Credentials and keys
+*.pem
+*.key
+*.crt
+*.csr
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.json
+service-account.json
+secrets/
+secrets.yaml
+secret.tfvars
+
+# ==========================================
+# PYTHON (API, Worker, Model-Service)
+# ==========================================
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -28,207 +54,51 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-*.pyc
+pip-wheel-metadata/
 
 # Virtual environments
 venv/
 env/
 ENV/
-.venv
+.venv/
+env.bak/
 
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.tox/
+.nox/
+junit.xml
+nosetests.xml
 
-# Logs
-*.log
-logs/
+# Type checking
+.mypy_cache/
+.dmypy.json
+.pytype/
+.pyre/
+
+# Linters & formatters
+.ruff_cache/
+
+# Package managers
+.uv/
+poetry.lock
+Pipfile.lock
 
 # Database
 *.db
 *.sqlite
 *.sqlite3
 
-# Models (large files - download separately)
-models/
-*.pth
-*.pt
-*.bin
-*.onnx
-*.h5
-
-# Temporary files
-tmp/
-temp/
-*.tmp
-
-# Coverage
-.coverage
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Node.js (for web frontend)
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-.next/
-out/
-.cache/
-
-# Build outputs
-dist/
-*.map
-
-# Docker
-docker-compose.override.yml
-
-# Terraform
-*.tfstate
-*.tfstate.*
-.terraform/
-.terraform.lock.hcl
-*.tfvars
-!example.tfvars
-
-# Secrets
-secrets/
-*.pem
-*.key
-*.cert
-credentials.json
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Videos and media (for testing)
-test_videos/
-uploads/
-*.mp4
-*.mov
-*.avi
-*.mkv
-*.webm
-!docs/**/*.mp4  # Allow sample videos in docs
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# devlogs (keep these tracked)
-!devlogs/*.txt
-
-# ==========================================
-#  GLOBAL / SYSTEM
-# ==========================================
-# OS-specific files
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Logs and temp files
-*.log
-*.out
-*.err
-*.pid
-*.seed
-*.bak
-*.tmp
-*.swp
-*.swo
-*.swm
-*.orig
-*.old
-
-# Environment variables
-.env
-.env.*
-!.env.example  # Keep example templates
-.envrc
-
-# ==========================================
-#  PYTHON / FASTAPI BACKEND
-# ==========================================
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg
-*.egg-info/
-.eggs/
-build/
-dist/
-*.manifest
-*.spec
-pip-wheel-metadata/
-wheelhouse/
-htmlcov/
-.coverage
-coverage.xml
-*.cover
-.pytest_cache/
-.tox/
-.nox/
-.mypy_cache/
-.dmypy.json
-.pyre/
-.pytype/
-.cache/
-instance/
-.venv/
-venv/
-env/
-ENV/
-env.bak/
-*.sqlite3
-
-# Package manager (uv / poetry / pipenv)
-.uv/
-poetry.lock
-Pipfile.lock
-
-# FastAPI / Alembic
-alembic.ini
+# Alembic (keep migration files, ignore temp)
 alembic/versions/*.pyc
 
-# Async job queues, cache, media
-celerybeat-schedule
-*.pid
-media/
-staticfiles/
-tmp/
-uploads/
-__pypackages__/
-
-# Model weights / large files
-*.pth
-*.pt
-*.bin
-*.h5
-*.ckpt
-*.onnx
-*.pb
-*.tflite
-*.npy
-*.npz
-*.tar.gz
-*.zip
-models/
-artifacts/
-checkpoints/
-outputs/
-inference_results/
-
 # ==========================================
-#  NODE / NEXT.JS FRONTEND
+# NODE.JS / NEXT.JS (Web Frontend)
 # ==========================================
 # Dependencies
 node_modules/
@@ -240,45 +110,92 @@ pnpm-debug.log*
 .bun/
 bun.lockb
 
-# Build outputs
+# Next.js build outputs
 .next/
 out/
-dist/
 build/
+
+# Testing
 coverage/
-.cache/
+
+# Misc
 .vercel/
-.vscode-test/
-
-# Static assets (generated)
-public/static/
-public/.next/
-.next/cache/
-
-# Local env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.turbo/
 
 # ==========================================
-#  INFRA / DEVOPS / DOCKER / IaC
+# MACHINE LEARNING MODELS & ARTIFACTS
 # ==========================================
-# Docker
-Dockerfile.local
+# Model weights (large files - download separately)
+models/
+*.pth
+*.pt
+*.bin
+*.h5
+*.ckpt
+*.onnx
+*.pb
+*.tflite
+*.safetensors
+
+# Model artifacts and outputs
+artifacts/
+checkpoints/
+outputs/
+inference_results/
+
+# Numpy arrays
+*.npy
+*.npz
+
+# Compressed archives (models)
+*.tar.gz
+*.zip
+
+# Cache directories for HuggingFace, Torch, etc.
+.cache/
+huggingface/
+transformers_cache/
+sentence_transformers/
+
+# ==========================================
+# MEDIA FILES
+# ==========================================
+# Videos (testing and uploads)
+uploads/
+test_videos/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+!docs/**/*.mp4  # Allow sample videos in documentation
+
+# Images (uploads only - keep static assets)
+# uploads/**/*.jpg
+# uploads/**/*.png
+
+# ==========================================
+# DOCKER & CONTAINERS
+# ==========================================
+# Override files (keep main docker-compose.yml)
 docker-compose.override.yml
-*.dockerfile
-docker-compose*.yml
+Dockerfile.local
+
+# Docker data volumes
 docker-data/
 .docker/
-docker/
-logs/
+
+# Container images
 *.tar
 *.img
 
+# ==========================================
+# INFRASTRUCTURE & DEVOPS
+# ==========================================
 # Terraform
 *.tfstate
 *.tfstate.*
+*.tfstate.backup
 crash.log
 .terraform/
 .terraform.lock.hcl
@@ -292,22 +209,47 @@ terraform.rc
 charts/
 *.kubeconfig
 values.override.yaml
-*.crt
-*.pem
-*.key
-*.csr
 
-# Cloud provider
+# Cloud provider configs
 .gcp/
 .aws/
 azure.json
-credentials.json
-service-account.json
-secrets.yaml
-secret.tfvars
 
 # ==========================================
-#  EDITORS / IDE
+# LOGS & TEMPORARY FILES
+# ==========================================
+# Logs
+*.log
+logs/
+*.out
+*.err
+startup.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+*.swm
+*.orig
+*.old
+
+# Process IDs
+*.pid
+*.seed
+
+# ==========================================
+# JUPYTER NOTEBOOKS
+# ==========================================
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+# Uncomment to ignore all notebooks:
+# *.ipynb
+
+# ==========================================
+# EDITORS & IDEs
 # ==========================================
 .vscode/
 .idea/
@@ -317,73 +259,54 @@ secret.tfvars
 *.code-workspace
 
 # ==========================================
-#  TESTING / CI / MISC
+# OPERATING SYSTEMS
 # ==========================================
-# pytest, coverage, etc.
-.coverage
-.pytest_cache/
-htmlcov/
-junit.xml
-nosetests.xml
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
 
-# Local testing data
+# Windows
+Thumbs.db
+desktop.ini
+
+# Linux
+*~
+
+# ==========================================
+# PROJECT SPECIFIC
+# ==========================================
+# Test data and sandboxes
 test_output/
 test_data/
 sandbox/
 
-# Git
-.gitignore~
-.gitattributes~
-.gitattributes.bak
-.gitmodules~
-*.orig
-
-# ==========================================
-#  OPTIONAL PROJECT SPECIFIC
-# ==========================================
-# Jupyter / notebooks
-.ipynb_checkpoints/
-notebooks/.ipynb_checkpoints/
-*.ipynb
-
-# Local API docs
-docs/_build/
-site/
-mkdocs.yml
-
-# Temporary data or large raw data
-data/
+# Raw data (large datasets)
+data/raw/
 datasets/
 raw_data/
-samples/
+
+# Documentation builds
+docs/_build/
+site/
+
+# Static file collections
+staticfiles/
+media/
+
+# Async job queues
+celerybeat-schedule
 
 # ==========================================
-#  SECURITY
+# KEEP THESE TRACKED
 # ==========================================
-# Private keys, tokens
-*.pem
-*.key
-*.crt
-*.csr
-*.der
-*.p12
-*.jks
-*.keystore
-*.pfx
-*.p12
+# Development logs (explicitly tracked)
+!devlogs/
+!devlogs/*.txt
 
-# ==========================================
-#  CUSTOM (per project)
-# ==========================================
-# Uncomment if using Supabase / Firebase locally
-# .supabase/
-# firebase-debug.log
+# Main docker compose (explicitly tracked)
+!docker-compose.yml
 
-# Uncomment if using AI services that cache models
-# huggingface/
-# .cache/huggingface/
-# .cache/torch/
-# transformers_cache/
-# sentence_transformers/
-
-
+# Example/template files
+!.env.example
+!terraform.tfvars.template

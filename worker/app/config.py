@@ -86,7 +86,13 @@ class Settings(BaseSettings):
     feature_vision: bool = True
     feature_face: bool = False
     feature_face_licensed: bool = False
+    feature_face_enrollment: bool = False  # Enable people profile photo upload
+    feature_face_detection: bool = False  # Enable face detection in video processing
+    feature_semantic_search: bool = False  # Enable vector similarity search
     feature_email_verification: bool = False
+
+    # Systems-level feature flags for search quality (sync with API)
+    feature_search_sys_canonical_trim: bool = False  # Enable text normalization before embedding
 
     # ML Models
     asr_model: Literal["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "turbo"] = "medium"

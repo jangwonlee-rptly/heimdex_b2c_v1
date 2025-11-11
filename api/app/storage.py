@@ -46,6 +46,7 @@ class StorageClient:
         buckets_to_create = [
             settings.storage_bucket_uploads,
             settings.storage_bucket_sidecars,
+            settings.storage_bucket_thumbnails,
         ]
 
         for bucket_name in buckets_to_create:

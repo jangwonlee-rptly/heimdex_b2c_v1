@@ -1,0 +1,88 @@
+{
+  "description": "Golden query set for search quality evaluation",
+  "version": "1.0",
+  "queries": [
+    {
+      "id": "q001",
+      "query": "person smiling",
+      "type": "semantic",
+      "expected_tags": ["person", "happy", "smile"],
+      "description": "Visual emotion detection"
+    },
+    {
+      "id": "q002",
+      "query": "crying baby",
+      "type": "semantic",
+      "expected_tags": ["crying", "baby", "infant"],
+      "description": "Specific emotional state"
+    },
+    {
+      "id": "q003",
+      "query": "night scene",
+      "type": "semantic",
+      "expected_tags": ["night", "dark", "evening"],
+      "description": "Time of day detection"
+    },
+    {
+      "id": "q004",
+      "query": "hello world",
+      "type": "keyword",
+      "expected_transcript": ["hello", "world"],
+      "description": "Exact transcript match"
+    },
+    {
+      "id": "q005",
+      "query": "birthday party",
+      "type": "hybrid",
+      "expected_tags": ["party", "celebration", "birthday"],
+      "expected_transcript": ["birthday", "party"],
+      "description": "Combined visual and text signals"
+    },
+    {
+      "id": "q006",
+      "query": "outdoor scene",
+      "type": "semantic",
+      "expected_tags": ["outdoor", "outside", "nature"],
+      "description": "Indoor/outdoor classification"
+    },
+    {
+      "id": "q007",
+      "query": "car driving",
+      "type": "semantic",
+      "expected_tags": ["car", "vehicle", "driving"],
+      "description": "Object and action detection"
+    },
+    {
+      "id": "q008",
+      "query": "thank you",
+      "type": "keyword",
+      "expected_transcript": ["thank", "you"],
+      "description": "Common phrase in transcript"
+    },
+    {
+      "id": "q009",
+      "query": "red object",
+      "type": "semantic",
+      "expected_tags": ["red"],
+      "description": "Color detection"
+    },
+    {
+      "id": "q010",
+      "query": "people talking",
+      "type": "hybrid",
+      "expected_tags": ["people", "person"],
+      "expected_transcript": ["talk", "conversation"],
+      "description": "Multi-modal conversation scene"
+    }
+  ],
+  "metrics": {
+    "min_recall_at_10": 0.7,
+    "min_mrr": 0.5,
+    "max_latency_p95_ms": 500
+  },
+  "notes": [
+    "This is a starter set - expand with domain-specific queries",
+    "Add video_id hints when golden results are known",
+    "Run before/after flag changes to measure impact"
+  ]
+}

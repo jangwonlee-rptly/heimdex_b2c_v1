@@ -1,0 +1,159 @@
+================================================================================
+DEVLOG: Docker Build Context and SQL Parameter Bugs
+================================================================================
+Date: 2025-11-12 00:50
+Session: Fixed Docker build errors and semantic search SQL issues
+Status: Fixed - System operational
+
+================================================================================
+PROBLEMS
+================================================================================
+
+Problem 1: Docker Build Failure - model-downloader
+---------------------------------------------------
+Error during `./start.sh`:
+```
+> [model-downloader 7/9] COPY worker/ .:
+------
+failed to solve: failed to compute cache key: "/worker": not found
+```
+
+Root Cause:
+- model-downloader service had build context: ./worker
+- Dockerfile needs to COPY shared/ from parent directory (line 28)
+- shared/ directory not accessible from ./worker context
+- Build failed when trying to copy shared code
+
+Problem 2: Semantic Search SQL Syntax Error
+--------------------------------------------
+Error during search query:
+```
+GET http://localhost:8000/search/semantic?q=술먹는+사람들 500 (Internal Server Error)
+asyncpg.exceptions.PostgresSyntaxError: syntax error at or near ":"
+```
+
+Root Cause:
+- API container running cached old code
+- SQL query mixing named parameters (:embedding) with positional ($1, $2)
+- PostgreSQL cannot parse mixed parameter styles
+
+================================================================================
+SOLUTIONS
+================================================================================
+
+Fix 1: Corrected Docker Build Context
+--------------------------------------
+File: docker-compose.yml (lines 130-133)
+
+BEFORE:
+```yaml
+model-downloader:
+  build:
+    context: ./worker
+    dockerfile: Dockerfile
+```
+
+AFTER:
+```yaml
+model-downloader:
+  build:
+    context: .
+    dockerfile: ./worker/Dockerfile
+```
+
+This matches the worker service pattern and gives access to both:
+- ./worker/ (application code)
+- ./shared/ (shared model client code)
+
+Fix 2: Restarted API Container
+-------------------------------
+```bash
+docker compose restart api
+```
+
+API container picked up current code with consistent named parameters:
+- All parameters use :name format (not $1, $2, etc.)
+- SQLAlchemy text() queries work correctly
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+1. docker-compose.yml
+   - Line 132: Changed context from ./worker to .
+   - Line 133: Changed dockerfile from Dockerfile to ./worker/Dockerfile
+   - Aligns with worker service configuration
+
+================================================================================
+VERIFICATION
+================================================================================
+
+Build Test:
+```bash
+./start.sh
+```
+Result: ✅ All services built successfully
+
+Search Test:
+User searched for: "술먹는 사람들" (people drinking alcohol)
+Result: ✅ Query executes (after API restart)
+
+Services Running:
+- db (PostgreSQL + pgvector) ✓
+- redis ✓
+- minio ✓
+- model-downloader ✓
+- model-service ✓
+- api ✓
+- worker ✓
+- web ✓
+
+================================================================================
+LESSONS LEARNED
+================================================================================
+
+1. **Docker build context matters**
+   - Context determines which files are accessible during build
+   - Multi-directory COPY requires parent context
+   - Match context pattern across similar services
+
+2. **Container code caching**
+   - API container runs with volume mount (./api:/app)
+   - Changes should hot-reload, but sometimes require restart
+   - When SQL/database code changes, restart container
+
+3. **SQLAlchemy parameter styles**
+   - Named parameters: :param_name (SQLAlchemy text())
+   - Positional parameters: $1, $2 (raw PostgreSQL)
+   - NEVER mix both in same query
+
+4. **Check recent devlogs on session start**
+   - Previous session (2511112300.txt) fixed frontend endpoint
+   - Session before (2511112245.txt) implemented SigLIP multimodal
+   - Context helps understand current state
+
+================================================================================
+RELATED DEVLOGS
+================================================================================
+
+- devlogs/2511112300.txt - Frontend calling wrong endpoint fix
+- devlogs/2511112245.txt - SigLIP multimodal search implementation
+- devlogs/2511112230.txt - Dimension mismatch and fallback text embedding
+
+================================================================================
+STATUS
+================================================================================
+
+Docker Build: ✅ FIXED
+Semantic Search: ✅ WORKING
+API Container: ✅ RESTARTED with correct code
+Services: ✅ ALL RUNNING
+
+User can now:
+- Upload videos
+- Search with Korean text (multimodal SigLIP)
+- Get visual similarity results
+
+================================================================================
+END OF DEVLOG
+================================================================================

@@ -1,0 +1,354 @@
+================================================================================
+DEVLOG: Phase 4 - Semantic Vector Search
+================================================================================
+Date: 2025-11-11 21:15
+Session: Phase 4 implementation
+Status: Complete, ready for testing with FEATURE_SEMANTIC_SEARCH=true
+
+================================================================================
+OVERVIEW
+================================================================================
+
+Implemented semantic search using pgvector cosine similarity:
+- Text embedding generation for queries (BGE-M3)
+- Vector similarity search on text_vec and image_vec
+- Hybrid scoring: text + vision + person boost
+- Person filter support in both keyword and semantic search
+
+Endpoints:
+- GET /search - Keyword search (existing, enhanced with person filter)
+- GET /search/semantic - NEW semantic vector search
+
+Feature flag: FEATURE_SEMANTIC_SEARCH (default: false)
+
+================================================================================
+FILES CREATED/MODIFIED
+================================================================================
+
+NEW: api/app/search/embeddings.py
+- Lazy-loaded BGE-M3 model for query embedding generation
+- generate_text_embedding() function
+- Singleton pattern for model caching (one model per worker process)
+
+MODIFIED: api/app/search/routes.py
+- Added imports for ScenePerson, FaceProfile, settings, text (for SQL)
+- Enhanced keyword search with person_id filtering (lines 108-113)
+- NEW semantic_search endpoint (lines 185-408)
+
+================================================================================
+IMPLEMENTATION DETAILS
+================================================================================
+
+1. Embedding Generation (embeddings.py):
+
+```python
+def get_text_embedding_model():
+    """Lazy-load BGE-M3 text embedding model."""
+    if "bge-m3" not in _embedding_models:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _embedding_models["bge-m3"] = FlagModel(
+            "BAAI/bge-m3",
+            query_instruction_for_retrieval="Represent this sentence for searching relevant passages:",
+            use_fp16=True if device == "cuda" else False,
+            cache_dir=os.getenv("MODELS_DIR", "./models") + "/.cache",
+            devices=[device]
+        )
+    return _embedding_models["bge-m3"]
+
+def generate_text_embedding(text: str) -> Optional[np.ndarray]:
+    """Generate 1024-dim embedding for search query."""
+    model = get_text_embedding_model()
+    embeddings = model.encode([text])
+    return embeddings[0]
+```
+
+2. Semantic Search SQL Query (routes.py:241-292):
+
+Uses pgvector cosine distance operator (<->) for similarity:
+
+```sql
+WITH scene_scores AS (
+    SELECT
+        s.scene_id, s.video_id, s.start_s, s.end_s, s.transcript, s.created_at,
+        -- Text similarity (1 - distance)
+        CASE WHEN s.text_vec IS NOT NULL
+            THEN (1 - (s.text_vec <-> :embedding::vector))
+            ELSE 0 END AS text_similarity,
+        -- Vision similarity (1 - distance)
+        CASE WHEN s.image_vec IS NOT NULL
+            THEN (1 - (s.image_vec <-> :embedding::vector))
+            ELSE 0 END AS vision_similarity,
+        -- Person boost
+        CASE WHEN :person_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM scene_people sp
+            WHERE sp.scene_id = s.scene_id AND sp.person_id = :person_id
+        ) THEN :person_boost ELSE 0 END AS person_boost_score
+    FROM scenes s
+    JOIN videos v ON s.video_id = v.video_id
+    WHERE v.user_id = :user_id
+      AND v.state = 'indexed'
+      AND (s.text_vec IS NOT NULL OR s.image_vec IS NOT NULL)
+      AND (:person_id IS NULL OR EXISTS (...))
+)
+SELECT *,
+    (text_similarity * :text_weight + vision_similarity * :vision_weight + person_boost_score) AS final_score
+FROM scene_scores
+WHERE final_score > 0
+ORDER BY final_score DESC
+LIMIT :limit OFFSET :offset
+```
+
+3. Hybrid Scoring Formula:
+
+final_score = (text_similarity × text_weight) + (vision_similarity × vision_weight) + person_boost
+
+Default weights (configurable):
+- text_weight: 0.5 (50%)
+- vision_weight: 0.35 (35%)
+- person_boost: 0.3 (30% bonus if person in scene)
+
+Similarity ranges: 0.0 (no match) to 1.0 (perfect match)
+Final score range: 0.0 to 1.85 (with person boost)
+
+4. Person Filter (both keyword and semantic):
+
+Keyword search (routes.py:108-113):
+```python
+if person_id:
+    query = query.join(
+        ScenePerson,
+        ScenePerson.scene_id == Scene.scene_id
+    ).where(ScenePerson.person_id == person_uuid)
+```
+
+Semantic search: Integrated into SQL (lines 260-275)
+
+================================================================================
+API USAGE
+================================================================================
+
+Semantic Search:
+GET /search/semantic?q=dancing&limit=10&person_id={uuid}
+
+Query Parameters:
+- q: Search query text (required)
+- limit: Max results (default: 10, max: 100)
+- offset: Pagination offset (default: 0)
+- person_id: Filter by person UUID (optional)
+- text_weight: Override text weight 0-1 (optional)
+- vision_weight: Override vision weight 0-1 (optional)
+
+Response:
+{
+  "results": [
+    {
+      "scene": {
+        "id": "scene_uuid",
+        "video_id": "video_uuid",
+        "start_time": 5.2,
+        "end_time": 12.8,
+        "transcript": "...",
+        "created_at": "2025-11-11T..."
+      },
+      "video": {...},
+      "score": 0.87,
+      "highlights": [
+        "Text similarity: 0.845",
+        "Vision similarity: 0.723",
+        "Person boost: 0.300"
+      ]
+    }
+  ],
+  "total": 15,
+  "query": "dancing",
+  "search_type": "semantic"
+}
+
+Keyword Search (enhanced):
+GET /search?q=dancing&person_id={uuid}
+
+Same response format, search_type="keyword"
+
+================================================================================
+CONFIGURATION
+================================================================================
+
+Environment Variables:
+- FEATURE_SEMANTIC_SEARCH=true (enable semantic search)
+- SEARCH_TEXT_WEIGHT=0.5 (text similarity weight)
+- SEARCH_VISION_WEIGHT=0.35 (vision similarity weight)
+- SEARCH_TAG_WEIGHT=0.15 (unused, reserved for future)
+- SEARCH_PERSON_BOOST=0.3 (person match bonus)
+- SEARCH_MAX_RESULTS=50 (max results per query)
+- SEARCH_DEFAULT_RESULTS=20 (default limit)
+
+Model Loading:
+- BGE-M3 loaded once per API worker process
+- Cached in memory for subsequent queries
+- GPU acceleration if available (falls back to CPU)
+- Cache directory: {MODELS_DIR}/.cache
+
+================================================================================
+PERFORMANCE NOTES
+================================================================================
+
+First Query (cold start):
+- Model loading: ~2-5 seconds
+- Query embedding: ~100-200ms (CPU) or ~20-50ms (GPU)
+- pgvector search: ~50-500ms (depends on data size, no index yet)
+- Total: ~3-6 seconds (first query only)
+
+Subsequent Queries (warm):
+- Query embedding: ~100-200ms (CPU) or ~20-50ms (GPU)
+- pgvector search: ~50-500ms
+- Total: ~150-700ms per query
+
+With Vector Index (future optimization):
+- IVFFLAT or HNSW index can reduce search to ~10-50ms
+- Trade-off: slightly less accuracy for much faster search
+- Recommended when scenes > 10,000
+
+Memory Usage:
+- BGE-M3 model: ~2GB RAM
+- Per query: ~10MB (embedding + results)
+
+Scaling:
+- Horizontal: Each API worker loads its own model
+- Vertical: GPU significantly speeds up embedding (5-10x)
+
+================================================================================
+VECTOR INDEXES (NOT YET IMPLEMENTED)
+================================================================================
+
+For production performance at scale, add vector indexes:
+
+```sql
+-- IVFFLAT index (faster, slightly less accurate)
+CREATE INDEX scenes_text_vec_ivfflat_idx
+ON scenes USING ivfflat (text_vec vector_cosine_ops)
+WITH (lists = 100);
+
+CREATE INDEX scenes_image_vec_ivfflat_idx
+ON scenes USING ivfflat (image_vec vector_cosine_ops)
+WITH (lists = 100);
+
+-- HNSW index (better accuracy, more memory)
+CREATE INDEX scenes_text_vec_hnsw_idx
+ON scenes USING hnsw (text_vec vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+```
+
+Recommendation:
+- Add indexes when scenes > 10,000 for noticeable speedup
+- IVFFLAT for memory-constrained environments
+- HNSW for better accuracy (production default)
+
+================================================================================
+TESTING INSTRUCTIONS
+================================================================================
+
+1. Enable semantic search:
+   echo "FEATURE_SEMANTIC_SEARCH=true" >> .env.local
+   docker compose restart api
+
+2. Test semantic search:
+   # Get auth token
+   TOKEN=$(curl -X POST http://localhost:8000/auth/login \
+     -H "Content-Type: application/json" \
+     -d '{"email":"user@example.com","password":"password"}' \
+     | jq -r '.access_token')
+
+   # Semantic search
+   curl "http://localhost:8000/search/semantic?q=dancing" \
+     -H "Authorization: Bearer $TOKEN"
+
+3. Compare keyword vs semantic:
+   # Keyword (exact substring match)
+   curl "http://localhost:8000/search?q=dancing" \
+     -H "Authorization: Bearer $TOKEN"
+
+   # Semantic (meaning-based, handles synonyms)
+   curl "http://localhost:8000/search/semantic?q=dancing" \
+     -H "Authorization: Bearer $TOKEN"
+
+4. Test with person filter (requires Phase 3):
+   curl "http://localhost:8000/search/semantic?q=talking&person_id={uuid}" \
+     -H "Authorization: Bearer $TOKEN"
+
+5. Test custom weights:
+   curl "http://localhost:8000/search/semantic?q=night&text_weight=0.7&vision_weight=0.3" \
+     -H "Authorization: Bearer $TOKEN"
+
+================================================================================
+COMPARISON: KEYWORD VS SEMANTIC
+================================================================================
+
+Keyword Search:
+- Uses SQL ILIKE pattern matching
+- Exact substring match (case-insensitive)
+- Fast: no ML model needed
+- Pros: Simple, fast, deterministic
+- Cons: Misses synonyms, paraphrases, semantic meaning
+
+Semantic Search:
+- Uses vector embeddings + cosine similarity
+- Meaning-based matching
+- Handles synonyms, paraphrases, multilingual
+- Pros: Better relevance, natural language understanding
+- Cons: Slower (requires embedding), needs GPU for speed
+
+Example:
+Query: "dog playing"
+- Keyword: Only matches transcripts containing "dog" AND "playing"
+- Semantic: Also matches "puppy running", "canine having fun", etc.
+
+================================================================================
+LIMITATIONS
+================================================================================
+
+1. Cross-modal search not implemented:
+   - Can't search with images (only text queries)
+   - Vision similarity computed from text embedding (not ideal)
+   - Future: Accept image uploads for vision-based search
+
+2. No vector indexes yet:
+   - Linear scan through all scenes (O(n))
+   - Acceptable for < 10,000 scenes
+   - Add HNSW/IVFFLAT indexes for production scale
+
+3. No reranking:
+   - Results sorted purely by cosine similarity
+   - Future: Add learned reranking model for better relevance
+
+4. Person boost is additive:
+   - Simple +0.3 bonus if person present
+   - Future: Multiply confidence score for weighted boost
+
+================================================================================
+ROLLBACK PLAN
+================================================================================
+
+If issues occur:
+1. Set FEATURE_SEMANTIC_SEARCH=false (disables endpoint)
+2. Restart API: docker compose restart api
+3. Keyword search remains functional
+
+To fully rollback:
+- Revert api/app/search/routes.py (remove semantic endpoint)
+- Delete api/app/search/embeddings.py
+- Restart API
+
+================================================================================
+STATUS
+================================================================================
+
+Phase 1: People Photo Upload ✅ COMPLETE
+Phase 2: Scene-Level Sidecars ✅ COMPLETE + TESTED
+Phase 3: Face Detection in Videos ✅ COMPLETE
+Phase 4: Semantic Vector Search ✅ COMPLETE (needs testing)
+
+All 4 Phases: ✅ COMPLETE
+
+System Status: Deployable with feature flags
+API Status: Restarted, semantic search ready
+Next: Real-world testing with videos and queries
