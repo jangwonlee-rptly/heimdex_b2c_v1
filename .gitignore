@@ -1,0 +1,389 @@
+# Heimdex B2C .gitignore
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.pyc
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Models (large files - download separately)
+models/
+*.pth
+*.pt
+*.bin
+*.onnx
+*.h5
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node.js (for web frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.next/
+out/
+.cache/
+
+# Build outputs
+dist/
+*.map
+
+# Docker
+docker-compose.override.yml
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!example.tfvars
+
+# Secrets
+secrets/
+*.pem
+*.key
+*.cert
+credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Videos and media (for testing)
+test_videos/
+uploads/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+!docs/**/*.mp4  # Allow sample videos in docs
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# devlogs (keep these tracked)
+!devlogs/*.txt
+
+# ==========================================
+#  GLOBAL / SYSTEM
+# ==========================================
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temp files
+*.log
+*.out
+*.err
+*.pid
+*.seed
+*.bak
+*.tmp
+*.swp
+*.swo
+*.swm
+*.orig
+*.old
+
+# Environment variables
+.env
+.env.*
+!.env.example  # Keep example templates
+.envrc
+
+# ==========================================
+#  PYTHON / FASTAPI BACKEND
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+*.manifest
+*.spec
+pip-wheel-metadata/
+wheelhouse/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+.pytest_cache/
+.tox/
+.nox/
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.cache/
+instance/
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+*.sqlite3
+
+# Package manager (uv / poetry / pipenv)
+.uv/
+poetry.lock
+Pipfile.lock
+
+# FastAPI / Alembic
+alembic.ini
+alembic/versions/*.pyc
+
+# Async job queues, cache, media
+celerybeat-schedule
+*.pid
+media/
+staticfiles/
+tmp/
+uploads/
+__pypackages__/
+
+# Model weights / large files
+*.pth
+*.pt
+*.bin
+*.h5
+*.ckpt
+*.onnx
+*.pb
+*.tflite
+*.npy
+*.npz
+*.tar.gz
+*.zip
+models/
+artifacts/
+checkpoints/
+outputs/
+inference_results/
+
+# ==========================================
+#  NODE / NEXT.JS FRONTEND
+# ==========================================
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.bun/
+bun.lockb
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+coverage/
+.cache/
+.vercel/
+.vscode-test/
+
+# Static assets (generated)
+public/static/
+public/.next/
+.next/cache/
+
+# Local env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ==========================================
+#  INFRA / DEVOPS / DOCKER / IaC
+# ==========================================
+# Docker
+Dockerfile.local
+docker-compose.override.yml
+*.dockerfile
+docker-compose*.yml
+docker-data/
+.docker/
+docker/
+logs/
+*.tar
+*.img
+
+# Terraform
+*.tfstate
+*.tfstate.*
+crash.log
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+terraform.tfvars.json
+!terraform.tfvars.template
+terraform.rc
+
+# Kubernetes / Helm
+.kube/
+charts/
+*.kubeconfig
+values.override.yaml
+*.crt
+*.pem
+*.key
+*.csr
+
+# Cloud provider
+.gcp/
+.aws/
+azure.json
+credentials.json
+service-account.json
+secrets.yaml
+secret.tfvars
+
+# ==========================================
+#  EDITORS / IDE
+# ==========================================
+.vscode/
+.idea/
+*.iml
+*.sublime-workspace
+*.sublime-project
+*.code-workspace
+
+# ==========================================
+#  TESTING / CI / MISC
+# ==========================================
+# pytest, coverage, etc.
+.coverage
+.pytest_cache/
+htmlcov/
+junit.xml
+nosetests.xml
+
+# Local testing data
+test_output/
+test_data/
+sandbox/
+
+# Git
+.gitignore~
+.gitattributes~
+.gitattributes.bak
+.gitmodules~
+*.orig
+
+# ==========================================
+#  OPTIONAL PROJECT SPECIFIC
+# ==========================================
+# Jupyter / notebooks
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+*.ipynb
+
+# Local API docs
+docs/_build/
+site/
+mkdocs.yml
+
+# Temporary data or large raw data
+data/
+datasets/
+raw_data/
+samples/
+
+# ==========================================
+#  SECURITY
+# ==========================================
+# Private keys, tokens
+*.pem
+*.key
+*.crt
+*.csr
+*.der
+*.p12
+*.jks
+*.keystore
+*.pfx
+*.p12
+
+# ==========================================
+#  CUSTOM (per project)
+# ==========================================
+# Uncomment if using Supabase / Firebase locally
+# .supabase/
+# firebase-debug.log
+
+# Uncomment if using AI services that cache models
+# huggingface/
+# .cache/huggingface/
+# .cache/torch/
+# transformers_cache/
+# sentence_transformers/
+
+

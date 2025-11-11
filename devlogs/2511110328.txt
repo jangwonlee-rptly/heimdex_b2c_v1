@@ -1,0 +1,969 @@
+Heimdex B2C - Session 7: Video Upload Integration & Worker Pipeline Debugging
+Date: 2025-11-11 03:28
+Duration: ~2 hours
+Session Type: Debugging & Integration
+
+=============================================================================
+SUMMARY
+=============================================================================
+
+User attempted first real video upload through the web UI and encountered
+multiple integration issues between API and worker containers. This session
+identified and partially fixed critical architectural problems with code
+sharing between separate Docker containers.
+
+Key Issues Discovered:
+1. ❌ API trying to import worker module (separate containers)
+2. ❌ Worker not loading tasks.video_processor module
+3. ❌ Models not available in worker container
+4. ⚠️  Dependency chain issues (app.db, app.config, app.logging_config)
+5. ⚠️  Architecture: Code sharing between containers needs redesign
+
+Progress Made:
+1. ✅ Fixed API's worker import using stub actor pattern
+2. ✅ Updated docker-compose.yml to load tasks.video_processor
+3. ✅ Copied initial models to worker container
+4. ⚠️  Discovered deeper dependency chain issues
+
+Status: PARTIALLY RESOLVED - Upload now queues tasks, but worker needs
+architectural fix for code sharing
+
+=============================================================================
+INITIAL ISSUE - VIDEO UPLOAD ERROR
+=============================================================================
+
+User Reported Error (API Container):
+```
+{"video_id": "06776a0e-e5a7-4a70-aa28-82d954042f63", "error": "No module named 'worker'",
+"event": "Failed to queue video processing task", "level": "error", "logger": "app.main",
+"timestamp": "2025-11-10T18:18:44.825019Z"}
+
+INFO:     172.19.0.1:50768 - "POST /videos/upload/complete HTTP/1.1" 202 Accepted
+```
+
+Symptoms:
+- Video uploaded successfully to MinIO (5.1 MB)
+- Video record created in database (state='validating')
+- Job record created (stage='upload_validate', state='pending')
+- Task NOT queued to Redis
+- Video NOT showing up in dashboard (stuck in validating state)
+- Error: "No module named 'worker'"
+
+=============================================================================
+ROOT CAUSE ANALYSIS
+=============================================================================
+
+Problem 1: Cross-Container Import
+--------------------------------
+
+Location: api/app/video/routes.py:214
+
+Problematic Code:
+```python
+from worker.tasks.video_processor import process_video
+process_video.send(str(video.video_id))
+```
+
+Why It Failed:
+- API and worker are SEPARATE Docker containers
+- Each has its own file system
+- API container doesn't have /app/worker/ directory
+- Can't import code from another container
+
+Architectural Context:
+- api/: Contains FastAPI application
+- worker/: Contains Dramatiq worker application
+- These are built from separate Dockerfiles
+- They communicate via Redis message broker, NOT Python imports
+
+Problem 2: Worker Not Loading Video Processor Module
+--------------------------------------------------
+
+Location: docker-compose.yml:235 (worker command)
+
+Problematic Configuration:
+```yaml
+command: dramatiq tasks.indexing tasks.asr tasks.vision tasks.faces --processes 2 --threads 4
+```
+
+Missing: tasks.video_processor
+
+Why It Failed:
+- Dramatiq only loads modules specified in command line
+- tasks.video_processor was implemented but not registered
+- Worker had the code but wasn't listening for those messages
+- Messages were queuing in Redis but never processed
+
+Discovery Process:
+1. Checked Redis queue: Messages present ✓
+2. Checked worker logs: No processing activity
+3. Checked running processes: Command didn't include tasks.video_processor
+4. Root cause: docker-compose outdated after new module added
+
+Problem 3: Models Not Available in Worker
+-----------------------------------------
+
+Location: worker/tasks/video_processor.py:106
+
+Problematic Code:
+```python
+from app.models.video import Video
+from app.models.scene import Scene
+from app.models.job import Job
+```
+
+Why It Failed:
+- Models defined in api/app/models/
+- Worker container doesn't have api/app/models/ directory
+- Worker needs access to same SQLAlchemy models as API
+- Current architecture doesn't share code between containers
+
+Attempted Solution:
+- Copied models from api/app/models/ to worker/app/models/
+- This revealed cascade of dependencies:
+  - Models import from app.db
+  - app.db imports from app.config
+  - app.config imports from app.logging_config
+  - Dependency chain goes deep
+
+Fundamental Issue:
+This reveals an ARCHITECTURAL PROBLEM - the API and worker need to share
+Python code (models, config, utilities) but are in separate containers
+with no code sharing mechanism.
+
+=============================================================================
+FIXES IMPLEMENTED
+=============================================================================
+
+Fix 1: API Worker Import - Stub Actor Pattern
+----------------------------------------------
+
+File: api/app/video/routes.py
+
+Before:
+```python
+from worker.tasks.video_processor import process_video
+process_video.send(str(video.video_id))
+```
+
+After:
+```python
+import dramatiq
+from dramatiq.brokers.redis import RedisBroker
+
+redis_url = settings.redis_url
+redis_broker = RedisBroker(url=redis_url)
+dramatiq.set_broker(redis_broker)
+
+# Create a stub actor that references the worker's process_video task
+@dramatiq.actor(
+    actor_name="process_video",
+    queue_name="video_processing",
+    broker=redis_broker
+)
+def process_video_stub(video_id_str: str):
+    """Stub - actual implementation is in worker container."""
+    pass
+
+# Send the task to the queue
+process_video_stub.send(str(video.video_id))
+```
+
+How It Works:
+- Stub actor declares that "process_video" actor exists
+- Doesn't import actual implementation
+- Sends message to Redis with correct actor name
+- Worker (which has real implementation) picks up message
+
+Benefits:
+- No cross-container imports
+- API and worker completely decoupled
+- Communication only through message broker
+- Standard Dramatiq pattern
+
+Result: ✅ API can now queue tasks without import errors
+
+Fix 2: Worker Module Loading
+----------------------------
+
+File: docker-compose.yml:235
+
+Before:
+```yaml
+command: dramatiq tasks.indexing tasks.asr tasks.vision tasks.faces --processes 2 --threads 4
+```
+
+After:
+```yaml
+command: dramatiq tasks.video_processor tasks.indexing tasks.asr tasks.vision tasks.faces --processes 2 --threads 4
+```
+
+Change:
+- Added tasks.video_processor to module list
+- Now worker loads and registers process_video actor
+
+Important:
+- docker compose restart doesn't apply command changes
+- Must use: docker compose up -d --force-recreate worker
+- Or: docker compose down && docker compose up -d
+
+Result: ✅ Worker now listens for video processing tasks
+
+Fix 3: Model Sharing (Partial)
+------------------------------
+
+Created: worker/app/models/
+
+Copied Models:
+- api/app/models/__init__.py → worker/app/models/__init__.py
+- api/app/models/video.py → worker/app/models/video.py
+- api/app/models/scene.py → worker/app/models/scene.py
+- api/app/models/job.py → worker/app/models/job.py
+- api/app/models/user.py → worker/app/models/user.py
+- api/app/models/face.py → worker/app/models/face.py
+
+Also Copied Dependencies (attempted):
+- api/app/db.py → worker/app/db.py
+- api/app/config.py → worker/app/config.py
+- api/app/logging_config.py → worker/app/logging_config.py
+
+Result: ⚠️ Partial success - imports resolved but dependency chain continues
+
+Fix 4: Trigger Stuck Video (Testing)
+-----------------------------------
+
+Created: api/trigger_stuck_video.py
+
+Purpose:
+- Manually queue video that was stuck in 'validating' state
+- Used for testing after fixes applied
+
+Script:
+```python
+import dramatiq
+from dramatiq.brokers.redis import RedisBroker
+
+VIDEO_ID = "06776a0e-e5a7-4a70-aa28-82d954042f63"
+redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+redis_broker = RedisBroker(url=redis_url)
+dramatiq.set_broker(redis_broker)
+
+@dramatiq.actor(actor_name="process_video", queue_name="video_processing", broker=redis_broker)
+def process_video_stub(video_id_str: str):
+    pass
+
+process_video_stub.send(VIDEO_ID)
+```
+
+Result: ✅ Successfully queued task to Redis
+
+=============================================================================
+TESTING & VERIFICATION
+=============================================================================
+
+Test 1: Check Video Record
+--------------------------
+```sql
+SELECT video_id, title, state, storage_key, size_bytes
+FROM videos
+WHERE video_id = '06776a0e-e5a7-4a70-aa28-82d954042f63';
+```
+
+Result:
+- video_id: 06776a0e-e5a7-4a70-aa28-82d954042f63
+- title: sample_video1.mp4
+- state: validating
+- storage_key: videos/02f413ea-760b-48f8-8199-fee70908a660/06776a0e-e5a7-4a70-aa28-82d954042f63.mp4
+- size_bytes: 5326124
+
+Status: ✅ Video record exists
+
+Test 2: Check Job Record
+------------------------
+```sql
+SELECT job_id, stage, state
+FROM jobs
+WHERE video_id = '06776a0e-e5a7-4a70-aa28-82d954042f63';
+```
+
+Result:
+- job_id: 8ac5dd5e-74e5-4dbc-b731-261041fa9ba7
+- stage: upload_validate
+- state: pending
+
+Status: ✅ Job record exists
+
+Test 3: Check File in MinIO
+---------------------------
+```bash
+mc ls local/uploads/videos/02f413ea-760b-48f8-8199-fee70908a660/
+```
+
+Result:
+- [2025-11-10 18:18:44 UTC] 5.1MiB STANDARD 06776a0e-e5a7-4a70-aa28-82d954042f63.mp4
+
+Status: ✅ Video file uploaded successfully
+
+Test 4: Check Redis Queue
+-------------------------
+```bash
+redis-cli HLEN dramatiq:video_processing.msgs
+```
+
+Result: 3 messages
+
+Sample Message:
+```json
+{
+  "queue_name":"video_processing",
+  "actor_name":"process_video",
+  "args":["06776a0e-e5a7-4a70-aa28-82d954042f63"],
+  "message_id":"387f952f-d8da-4b3b-aaa1-9b1616a36c7f",
+  "message_timestamp":1762798884629
+}
+```
+
+Status: ✅ Messages queued correctly
+
+Test 5: Worker Picks Up Task
+----------------------------
+
+After fixes and worker recreation:
+
+Worker Logs:
+```
+[worker] Starting processing for video_id=06776a0e-e5a7-4a70-aa28-82d954042f63
+```
+
+Status: ✅ Worker now picking up tasks!
+
+Test 6: Worker Processing
+-------------------------
+
+Error Encountered:
+```
+ModuleNotFoundError: No module named 'app.db'
+[2025-11-10 18:27:50,979] [PID 8] [Thread-13] [dramatiq.middleware.retries.Retries] [WARNING] Retries exceeded for message
+```
+
+Status: ❌ Processing fails due to missing dependencies
+
+After 3 retries (max_retries=2 + original attempt):
+- Message marked as failed
+- Video remains in 'validating' state
+- Error logged but not persisted to database
+
+=============================================================================
+ARCHITECTURAL ISSUES IDENTIFIED
+=============================================================================
+
+Issue 1: Code Duplication Anti-Pattern
+--------------------------------------
+
+Current Approach:
+- Copying files from api/app/ to worker/app/
+- Duplicates: models, db.py, config.py, logging_config.py
+- Changes must be made in two places
+- High risk of drift between copies
+
+Problems:
+- Violates DRY principle
+- Maintenance nightmare
+- Testing complexity
+- Version sync issues
+
+Issue 2: Dependency Chain Complexity
+------------------------------------
+
+Discovered Dependencies:
+```
+models/__init__.py
+  └─> models/user.py
+       └─> app.db
+            └─> app.config
+                 └─> app.logging_config
+                      └─> structlog, python-json-logger
+```
+
+Each dependency may have its own dependencies:
+- app.config might import other utilities
+- app.logging_config configures external libraries
+- Models might have validation logic with dependencies
+
+Copying files doesn't scale - need proper package structure
+
+Issue 3: Async vs. Sync SQLAlchemy Mismatch
+-------------------------------------------
+
+API Models:
+- Defined for AsyncSession
+- Use: AsyncSession, async def, await
+
+Worker Code (video_processor.py):
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+engine = create_engine(db_url)  # Synchronous!
+Session = sessionmaker(bind=engine)
+session = Session()
+```
+
+Problem:
+- Models expect async but worker uses sync
+- Can't use async Session in Dramatiq workers (blocks threads)
+- Models need to work with both async (API) and sync (worker)
+
+This is a FUNDAMENTAL ARCHITECTURE ISSUE
+
+=============================================================================
+PROPER SOLUTIONS (NOT YET IMPLEMENTED)
+=============================================================================
+
+Solution 1: Shared Python Package (Recommended)
+-----------------------------------------------
+
+Structure:
+```
+heimdex_b2c/
+├── shared/
+│   ├── __init__.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── video.py
+│   │   ├── scene.py
+│   │   ├── user.py
+│   │   ├── job.py
+│   │   └── face.py
+│   ├── db.py
+│   ├── config.py
+│   └── utils.py
+├── api/
+│   ├── Dockerfile (COPY ../shared /app/shared)
+│   └── app/
+│       └── (imports from shared.models)
+├── worker/
+│   ├── Dockerfile (COPY ../shared /app/shared)
+│   └── tasks/
+│       └── (imports from shared.models)
+└── docker-compose.yml
+```
+
+Benefits:
+- Single source of truth
+- No duplication
+- Easier to maintain
+- Standard Python package structure
+
+Implementation:
+1. Create shared/ directory
+2. Move models, db, config to shared/
+3. Update Dockerfiles to copy shared/
+4. Update imports throughout codebase
+5. Add shared/ to PYTHONPATH in both containers
+
+Solution 2: Docker Volume Mount (Development)
+---------------------------------------------
+
+docker-compose.yml:
+```yaml
+api:
+  volumes:
+    - ./shared:/app/shared
+
+worker:
+  volumes:
+    - ./shared:/app/shared
+```
+
+Benefits:
+- Immediate code sharing
+- Good for development
+- No build needed for code changes
+
+Drawbacks:
+- Only works for development
+- Can't deploy to production this way
+- Performance implications
+
+Solution 3: Separate Models Package
+-----------------------------------
+
+Create: heimdex-models Python package
+
+Publish to private PyPI or install from git:
+```
+pip install git+https://github.com/your-org/heimdex-models.git
+```
+
+Benefits:
+- Professional approach
+- Versioned dependencies
+- Can use in multiple projects
+- Clear separation of concerns
+
+Drawbacks:
+- More complex setup
+- Need CI/CD for package publishing
+- Overkill for single project
+
+Solution 4: Fix Async/Sync SQLAlchemy Usage
+-------------------------------------------
+
+Option A: Make models work with both async and sync
+
+Create base classes that work with both:
+```python
+# In shared/models/base.py
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+
+# Models just inherit from Base
+# Both sync and async sessions can use them
+```
+
+Option B: Keep separate session factories
+```python
+# For API (async)
+async_engine = create_async_engine(...)
+AsyncSession = sessionmaker(async_engine, class_=AsyncSession)
+
+# For worker (sync)
+sync_engine = create_engine(...)
+SyncSession = sessionmaker(sync_engine)
+```
+
+Models remain the same, sessions differ
+
+=============================================================================
+RECOMMENDED ACTION PLAN
+=============================================================================
+
+Immediate (Next Session):
+-------------------------
+
+1. ✅ Implement Solution 1: Shared Package
+   - Create shared/ directory
+   - Move models/ to shared/models/
+   - Move db.py, config.py, logging_config.py to shared/
+   - Update Dockerfiles
+   - Update all imports
+   - Test with clean build
+
+2. ✅ Fix Async/Sync SQLAlchemy
+   - Verify models work with sync sessions
+   - Update worker to use sync engine correctly
+   - Test that models instantiate properly
+
+3. ✅ Test End-to-End Upload
+   - Upload new test video via web UI
+   - Verify task queues correctly
+   - Verify worker processes successfully
+   - Verify scenes get indexed
+   - Verify video appears in dashboard
+
+Short Term (This Week):
+----------------------
+
+1. Add proper error handling
+   - Catch and log specific errors
+   - Update video.error_text on failure
+   - Update job.state appropriately
+
+2. Add progress tracking
+   - Update job.progress during processing
+   - Frontend can poll for status
+
+3. Implement search endpoint
+   - Now that videos will be indexed
+   - Hybrid text + vision search
+   - Return matching scenes
+
+4. Add scene preview
+   - Generate signed URLs for video segments
+   - Video player component in frontend
+
+Medium Term (Next 2 Weeks):
+--------------------------
+
+1. Comprehensive testing
+   - Unit tests for models
+   - Integration tests for upload flow
+   - Worker pipeline tests
+
+2. Production deployment prep
+   - Environment-specific configs
+   - Secrets management
+   - GCS integration (replace MinIO)
+
+3. Monitoring and alerting
+   - Worker health checks
+   - Failed job alerts
+   - Queue depth monitoring
+
+=============================================================================
+LESSONS LEARNED
+=============================================================================
+
+1. Microservices Need Code Sharing Strategy
+-------------------------------------------
+
+Lesson: Can't just "import" across container boundaries
+
+When to Plan:
+- BEFORE implementing worker
+- When designing microservices architecture
+- Before writing models used by multiple services
+
+Common Patterns:
+- Shared Python package (most common)
+- gRPC/Protobuf definitions
+- OpenAPI client generation
+- Docker volumes (dev only)
+
+2. Container Recreation vs. Restart
+-----------------------------------
+
+Lesson: docker compose restart doesn't apply all changes
+
+What Requires Restart:
+- Code changes (with hot reload)
+- Environment variable changes
+
+What Requires Recreation:
+- Command changes
+- Volume changes
+- Network changes
+- Build changes
+
+Commands:
+```bash
+# Restart (uses existing container)
+docker compose restart service
+
+# Recreate (builds new container)
+docker compose up -d --force-recreate service
+
+# Full rebuild
+docker compose up -d --build --force-recreate service
+```
+
+3. Message Brokers Decouple Services
+------------------------------------
+
+Lesson: Redis/RabbitMQ messages don't need shared code
+
+Pattern:
+- Service A: Creates stub actor, sends message
+- Service B: Has real actor, processes message
+- Communication: JSON over message broker
+- No shared Python code needed!
+
+This is CORRECT for microservices
+
+Problem We Hit:
+- Worker needed to deserialize message into domain objects (models)
+- Domain objects require shared code
+- This is where shared package is needed
+
+4. Dramatiq Module Loading is Explicit
+--------------------------------------
+
+Lesson: Workers only load modules you tell them to
+
+Command:
+```bash
+dramatiq module1 module2 module3
+```
+
+Only actors in those modules are registered
+
+If you add a new task module:
+1. Add to dramatiq command
+2. Recreate worker container
+3. Verify worker logs show module loading
+
+5. Async/Sync Mixing is Tricky
+------------------------------
+
+Lesson: SQLAlchemy async models may not work with sync sessions
+
+Problem:
+- FastAPI uses async for concurrency
+- Dramatiq uses sync (thread-based workers)
+- Same models need to work in both
+
+Solution:
+- Define models with Base from declarative_base()
+- Use AsyncSession in API
+- Use regular Session in worker
+- Models themselves are compatible
+
+6. Integration Testing is Critical
+----------------------------------
+
+Lesson: Individual pieces worked, integration revealed issues
+
+What Worked in Isolation:
+- API could create video records ✓
+- Worker could load models ✓
+- Redis could queue messages ✓
+
+What Failed in Integration:
+- API couldn't import worker ✗
+- Worker wasn't loading module ✗
+- Models not available in worker ✗
+
+Implication:
+- Unit tests wouldn't catch these
+- Need end-to-end integration tests
+- Test in environment close to production
+
+=============================================================================
+FILES MODIFIED
+=============================================================================
+
+Modified:
+---------
+1. api/app/video/routes.py
+   - Replaced worker import with stub actor pattern
+   - Lines changed: ~25
+
+2. docker-compose.yml
+   - Added tasks.video_processor to worker command
+   - Lines changed: 1
+
+Created:
+--------
+1. api/trigger_stuck_video.py
+   - Manual task queueing script for testing
+   - 25 lines
+
+2. worker/app/__init__.py
+   - Package marker
+   - 1 line
+
+3. worker/app/models/__init__.py (copied)
+   - Model exports
+   - ~20 lines
+
+4. worker/app/models/video.py (copied)
+   - Video model
+   - ~100 lines
+
+5. worker/app/models/scene.py (copied)
+   - Scene model
+   - ~80 lines
+
+6. worker/app/models/job.py (copied)
+   - Job model
+   - ~90 lines
+
+7. worker/app/models/user.py (copied)
+   - User model
+   - ~70 lines
+
+8. worker/app/models/face.py (copied)
+   - Face models
+   - ~100 lines
+
+9. worker/app/db.py (copied)
+   - Database configuration
+   - ~50 lines
+
+10. worker/app/config.py (copied)
+    - Application config
+    - ~200 lines
+
+11. worker/app/logging_config.py (copied)
+    - Logging setup
+    - ~50 lines
+
+Total:
+- Files modified: 2
+- Files created: 11
+- Lines added: ~800
+- Containers recreated: 2 (API, worker)
+
+=============================================================================
+CURRENT STATE
+=============================================================================
+
+What's Working:
+---------------
+✅ API server healthy
+✅ Web UI accessible
+✅ User authentication
+✅ Video upload to MinIO
+✅ Database records created
+✅ Tasks queued to Redis
+✅ Worker picks up tasks
+✅ Worker starts processing
+
+What's Not Working:
+------------------
+❌ Worker fails on dependency imports (app.db, etc.)
+❌ Video processing doesn't complete
+❌ Videos stuck in 'validating' state
+❌ No search results (no indexed videos)
+❌ Dashboard shows no videos (stuck state filtered out)
+
+System Health:
+-------------
+- Infrastructure: ✅ Healthy
+- API: ✅ Operational
+- Worker: ⚠️ Running but failing tasks
+- Database: ✅ Healthy
+- Redis: ✅ Healthy
+- MinIO: ✅ Healthy
+
+Blocker:
+-------
+Architecture needs refactoring to properly share code between API and worker
+containers. Current file-copying approach doesn't scale.
+
+=============================================================================
+NEXT SESSION PLAN
+=============================================================================
+
+Priority 1: Fix Code Sharing Architecture
+-----------------------------------------
+
+Task: Implement shared package solution
+
+Steps:
+1. Create shared/ directory in project root
+2. Move models to shared/models/
+3. Move db.py, config.py to shared/
+4. Update api/Dockerfile to COPY shared/
+5. Update worker/Dockerfile to COPY shared/
+6. Update all imports in API (from shared.models import...)
+7. Update all imports in worker (from shared.models import...)
+8. Remove copied files from worker/app/
+9. Clean rebuild: docker compose build --no-cache
+10. Test: docker compose up -d
+
+Expected Time: 30 minutes
+
+Priority 2: Test End-to-End
+---------------------------
+
+Task: Upload and process a video
+
+Steps:
+1. Upload new test video via web UI
+2. Monitor API logs
+3. Monitor worker logs
+4. Check video progresses through states:
+   - uploading → validating → processing → indexed
+5. Check scenes created in database
+6. Verify dashboard shows video
+
+Expected Time: 15 minutes
+
+Priority 3: Implement Search Endpoint
+------------------------------------
+
+Task: Now that videos will be indexed, make them searchable
+
+Steps:
+1. Create api/app/search/ directory
+2. Implement GET /search endpoint
+3. Hybrid search (text + vision embeddings)
+4. Return matching scenes with scores
+5. Test from frontend
+
+Expected Time: 1 hour
+
+=============================================================================
+DOCUMENTATION UPDATES NEEDED
+=============================================================================
+
+1. README.md
+   - Update architecture diagram (show shared package)
+   - Document upload flow
+
+2. CURRENT_STATUS.md
+   - Mark video upload as "In Progress" (not complete)
+   - Update blockers section
+
+3. docs/ARCHITECTURE.md (create)
+   - Document code sharing strategy
+   - Explain API/worker separation
+   - Show message flow
+
+4. docs/guides/TROUBLESHOOTING.md
+   - Add section on "No module named 'worker'" error
+   - Add section on docker compose restart vs. recreate
+
+=============================================================================
+TIME BREAKDOWN
+=============================================================================
+
+Investigation: 30 minutes
+- Identify API import error
+- Check Redis queue
+- Verify worker command
+- Test model imports
+
+Fixes: 60 minutes
+- Implement stub actor pattern
+- Update docker-compose.yml
+- Copy models to worker
+- Multiple recreation attempts
+- Test and verify
+
+Documentation: 30 minutes
+- Write comprehensive devlog
+- Document architecture issues
+- Create action plan
+
+Total: 2 hours
+
+=============================================================================
+CONCLUSION
+=============================================================================
+
+This session revealed fundamental architectural issues with code sharing
+between microservices. While we made significant progress:
+
+✅ Fixed immediate import errors
+✅ Enabled task queueing from API
+✅ Got worker to pick up tasks
+✅ Identified root cause of failures
+
+The blocking issue is clear: API and worker need a shared Python package
+for models and core utilities. This is a standard microservices pattern
+that should have been implemented from the start.
+
+Next session will implement the shared package architecture, which should
+resolve all remaining issues and enable end-to-end video processing.
+
+The good news: Everything else is working correctly (storage, queueing,
+models, database). Once code sharing is fixed, the pipeline should work.
+
+=============================================================================
+STATUS SUMMARY
+=============================================================================
+
+Project Completion: 60% → 62% (+2%)
+- Small progress due to architectural blocker
+- Upload flow partially working
+- Worker integration partially working
+
+Next Milestone: End-to-end video processing
+Required: Shared package architecture fix
+Estimated: 1 more session to unblock
+
+=============================================================================
+END OF SESSION
+=============================================================================
+
+Session Type: Integration Debugging
+Outcome: Partial success, architecture issue identified
+Blocker: Code sharing between containers
+Next Session: Implement shared package solution
+
+Date: 2025-11-11 03:28
+Duration: 2 hours

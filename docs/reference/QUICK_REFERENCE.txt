@@ -1,0 +1,103 @@
+╔═══════════════════════════════════════════════════════════════════╗
+║                  HEIMDEX B2C - QUICK REFERENCE                    ║
+╚═══════════════════════════════════════════════════════════════════╝
+
+🚀 ONE-COMMAND SETUP
+────────────────────
+./start.sh
+
+⏱️  FIRST RUN TIMELINE
+────────────────────
+Build: 5-10 min → Infrastructure: 30s → Models: 10-15 min → Ready!
+Total: ~20-25 minutes (then 30s for subsequent runs)
+
+📊 CHECK STATUS
+────────────────────
+docker compose ps                    # Service status
+docker compose logs -f api           # API logs
+docker compose logs -f worker        # Worker logs
+docker compose logs -f model-downloader  # Model download progress
+
+🔗 SERVICES (After Setup)
+────────────────────
+API:           http://localhost:8000
+API Docs:      http://localhost:8000/docs
+Health:        http://localhost:8000/health
+Metrics:       http://localhost:8000/metrics
+MinIO Console: http://localhost:9001 (minioadmin/minioadmin)
+
+✅ VERIFY WORKING
+────────────────────
+curl http://localhost:8000/health
+# Should return: {"status":"healthy","version":"0.1.0"}
+
+🛠️  USEFUL COMMANDS
+────────────────────
+docker compose up -d                 # Start all services
+docker compose down                  # Stop all services
+docker compose restart api           # Restart specific service
+docker compose logs -f               # View all logs
+docker compose exec api bash         # Shell into API container
+docker compose exec db psql -U heimdex -d heimdex  # Database shell
+
+🔄 RESET EVERYTHING
+────────────────────
+docker compose down -v               # ⚠️  Deletes all data!
+./start.sh                          # Start fresh
+
+📁 KEY FILES
+────────────────────
+QUICK START.md       - Setup & implementation guide
+TROUBLESHOOTING.md   - Common issues & solutions
+PROJECT_STATUS.md    - Progress tracking (~20%)
+docs/models.md       - ML model details & licenses
+devlogs/2511102122.txt  - Detailed session log
+
+🐛 COMMON ISSUES
+────────────────────
+Port in use?
+  → lsof -i :8000
+  → docker stop <conflicting_container>
+
+Migrations failed?
+  → docker compose restart db-migrate
+  → docker compose logs db-migrate
+
+Models stuck?
+  → docker compose logs -f model-downloader
+  → Patience! ~4 GB download
+
+API won't start?
+  → Check: docker compose logs api
+  → Wait for: db-migrate to complete
+
+📝 NEXT STEPS (After Setup)
+────────────────────
+1. Verify: curl http://localhost:8000/health
+2. Browse: http://localhost:8000/docs
+3. Code: Implement auth routes (see QUICKSTART.md)
+
+🎯 IMPLEMENTATION PRIORITY
+────────────────────
+1. SQLAlchemy models (User, Video, Scene)
+2. Auth routes (register, login, JWT)
+3. Upload flow (presigned URLs, ffprobe)
+4. Worker pipeline (ASR → embeddings)
+5. Search endpoint (hybrid scoring)
+6. Next.js web app
+
+☁️  DEPLOY TO GCP
+────────────────────
+./deploy-gcp.sh
+# Prerequisites: gcloud CLI + Terraform installed
+
+🆘 HELP
+────────────────────
+QUICKSTART.md        - Full setup guide
+TROUBLESHOOTING.md   - Common problems
+README.md            - Project overview
+GitHub Issues        - Report bugs
+
+╔═══════════════════════════════════════════════════════════════════╗
+║  TIP: Let ./start.sh finish, grab coffee, then start coding! ☕   ║
+╚═══════════════════════════════════════════════════════════════════╝

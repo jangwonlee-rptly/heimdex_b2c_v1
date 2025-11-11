@@ -1,0 +1,652 @@
+Heimdex B2C - Session 5: Critical Bug Fixes for Authentication, Database, and Video Upload
+Date: 2025-11-10 17:25 - 17:58
+Duration: ~33 minutes
+
+=============================================================================
+SUMMARY
+=============================================================================
+
+Fixed multiple critical production-blocking bugs preventing user authentication,
+video listing, and video uploads. All issues stemmed from incomplete Supabase
+integration, missing database migrations, and Docker networking configuration.
+
+Issues Resolved:
+1. ✅ /auth/me endpoint returning 500 errors
+2. ✅ Missing title/description columns in videos table
+3. ✅ Video list endpoint crashing on enum serialization
+4. ✅ Video upload failing with 403 Forbidden (presigned URL issues)
+5. ✅ MinIO presigned URLs using internal Docker hostnames
+
+Final Status: All authentication, video listing, and upload features functional
+
+=============================================================================
+PROBLEM 1: Authentication Endpoint Failure
+=============================================================================
+
+ERROR:
+```
+INFO:     172.19.0.1:55094 - "GET /auth/me HTTP/1.1" 500 Internal Server Error
+AttributeError: 'NoneType' object has no attribute 'user'
+  File "/app/app/auth/routes.py", line 395, in get_current_user_profile
+    if not user.user:
+           ^^^^^^^^^
+```
+
+Root Cause:
+The /auth/me endpoint (api/app/auth/routes.py:393) was calling supabase.auth.get_user()
+on a Supabase client without a JWT token set. This returned None, causing an
+AttributeError when accessing user.user.
+
+Initial Implementation (BROKEN):
+```python
+@router.get("/me", response_model=UserResponse)
+async def get_current_user_profile(
+    current_user: AuthUser = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+):
+    user = supabase.auth.get_user()  # Returns None - no token set!
+    if not user.user:  # AttributeError here
+        raise HTTPException(...)
+```
+
+Why It Failed:
+- current_user dependency already authenticated via JWT
+- Attempted to re-authenticate with Supabase client without token context
+- Supabase client wasn't session-scoped to the request
+
+Solution:
+Query the local PostgreSQL database directly using the authenticated user's
+supabase_user_id instead of calling Supabase API.
+
+Fixed Implementation:
+```python
+@router.get("/me", response_model=UserResponse)
+async def get_current_user_profile(
+    current_user: AuthUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+    from app.models.user import User
+    from uuid import UUID
+
+    stmt = select(User).where(
+        User.supabase_user_id == UUID(current_user.supabase_user_id)
+    )
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    return UserResponse(
+        id=current_user.supabase_user_id,
+        email=user.email,
+        email_verified=user.email_verified,
+        display_name=user.display_name,
+        created_at=user.created_at.isoformat(),
+    )
+```
+
+Files Modified:
+- api/app/auth/routes.py (lines 375-427)
+
+Lesson Learned:
+When using dependency injection with authenticated users, don't re-authenticate
+with external services. Use the local database as the source of truth for user data.
+
+=============================================================================
+PROBLEM 2: Missing Database Columns
+=============================================================================
+
+ERROR:
+```
+sqlalchemy.exc.ProgrammingError: column videos.title does not exist
+[SQL: SELECT videos.video_id, videos.user_id, videos.storage_key,
+      videos.mime_type, videos.size_bytes, videos.duration_s, videos.title,
+      videos.description, videos.state, videos.error_text, videos.created_at,
+      videos.indexed_at FROM videos WHERE videos.user_id = $1::UUID]
+```
+
+Root Cause:
+The Video model (api/app/models/video.py) defined title and description columns:
+```python
+title = Column(String(255), nullable=True)
+description = Column(Text, nullable=True)
+```
+
+But the initial migration (db/migrations/versions/20251110_2100_001_initial_schema.py)
+didn't create these columns in the videos table (lines 38-54).
+
+This was a mismatch between the SQLAlchemy model and the actual database schema.
+
+Solution:
+Created migration 003 to add the missing columns:
+
+```python
+# db/migrations/versions/20251111_0100_003_add_video_metadata.py
+def upgrade() -> None:
+    op.add_column('videos', sa.Column('title', sa.String(255), nullable=True))
+    op.add_column('videos', sa.Column('description', sa.Text(), nullable=True))
+
+def downgrade() -> None:
+    op.drop_column('videos', 'description')
+    op.drop_column('videos', 'title')
+```
+
+Migration Execution:
+```bash
+$ docker compose up db-migrate --force-recreate
+INFO [alembic.runtime.migration] Running upgrade 002 -> 003, Add title and
+     description columns to videos table
+```
+
+Verification:
+```sql
+\d videos
+   Column    |           Type           | Nullable | Default
+-------------+--------------------------+----------+----------
+...
+ title       | character varying(255)   |          |
+ description | text                     |          |
+```
+
+Files Created:
+- db/migrations/versions/20251111_0100_003_add_video_metadata.py
+
+Lesson Learned:
+Always ensure database migrations are created when modifying SQLAlchemy models.
+Use `alembic revision --autogenerate` to catch schema drift.
+
+=============================================================================
+PROBLEM 3: Enum Serialization Errors
+=============================================================================
+
+ERROR:
+```
+AttributeError: 'str' object has no attribute 'value'
+  File "/app/app/video/routes.py", line 276, in <listcomp>
+    state=v.state.value,
+          ^^^^^^^^^^^^
+```
+
+Root Cause:
+The code was calling .value on enum fields (state, stage) that were already
+strings due to SQLAlchemy's native_enum=True configuration.
+
+SQLAlchemy Enum Configuration:
+```python
+# api/app/models/video.py
+state = Column(
+    SQLEnum(
+        'uploading', 'validating', 'processing', 'indexed', 'failed', 'deleted',
+        name='video_state',
+        create_constraint=False,
+        native_enum=True,  # Returns string values, not Python Enum objects
+    ),
+    nullable=False,
+    default='uploading',
+)
+```
+
+With native_enum=True, SQLAlchemy returns 'uploading' (str), not VideoState.UPLOADING.
+
+Broken Code Locations:
+- api/app/video/routes.py:232 - state=video.state.value
+- api/app/video/routes.py:276 - state=v.state.value
+- api/app/video/routes.py:315 - state=video.state.value
+- api/app/video/routes.py:358 - state=video.state.value
+- api/app/video/routes.py:364 - state=job.state.value
+
+Solution:
+Remove all .value attribute accesses since the values are already strings:
+
+```python
+# Before (BROKEN):
+state=video.state.value
+
+# After (FIXED):
+state=video.state
+```
+
+Files Modified:
+- api/app/video/routes.py (lines 232, 276, 315, 358, 363, 364)
+
+Alternative Solutions Considered:
+1. Change native_enum=True to False (returns Python Enum objects)
+   - Rejected: Would require changes across codebase
+2. Add property accessors to model
+   - Rejected: Unnecessary complexity
+
+Lesson Learned:
+When using SQLAlchemy native_enum=True, the column returns database-native
+enum strings, not Python Enum instances. Don't call .value on native enums.
+
+=============================================================================
+PROBLEM 4: Video Upload Presigned URL Issues (403 Forbidden)
+=============================================================================
+
+ERROR SEQUENCE:
+
+Attempt 1 - Malformed URL:
+```
+PUT :9000/uploads/videos/.../file.mp4 403 (Forbidden)
+```
+Missing hostname entirely.
+
+Attempt 2 - Invalid Signature:
+```
+PUT http://localhost:9000/uploads/videos/.../file.mp4 403 (Forbidden)
+```
+Correct URL format, but signature validation failed.
+
+Attempt 3 - Internal Hostname:
+```
+PUT http://minio:9000/uploads/videos/.../file.mp4 net::ERR_NAME_NOT_RESOLVED
+```
+URL contained Docker internal hostname, unreachable from browser.
+
+Root Cause Analysis:
+
+MinIO generates presigned URLs using AWS Signature Version 4, which includes
+the Host header in signature calculation:
+
+```
+Signature = HMAC-SHA256(
+    SigningKey,
+    StringToSign(
+        HTTPMethod,
+        CanonicalURI,
+        CanonicalQueryString,
+        CanonicalHeaders,  # <-- Includes Host header!
+        SignedHeaders,
+        HashedPayload
+    )
+)
+```
+
+The Problem:
+1. API container connects to MinIO via Docker network: minio:9000
+2. MinIO generates presigned URL with Host: minio:9000
+3. Signature is calculated with Host: minio:9000
+4. We need browser to access localhost:9000
+5. Changing URL to localhost:9000 invalidates signature (Host mismatch)
+
+Attempted Solutions That Failed:
+
+❌ Solution 1: String Replacement After Generation
+```python
+url = client.presigned_put_object(bucket, object_key, expires)
+url = url.replace("minio:9000", "localhost:9000")  # Breaks signature!
+```
+Why it failed: Signature no longer matches Host header.
+
+❌ Solution 2: MINIO_SERVER_URL Environment Variable
+```yaml
+minio:
+  environment:
+    MINIO_SERVER_URL: http://localhost:9000
+```
+Why it failed: MinIO container can't resolve localhost:9000 to itself.
+
+❌ Solution 3: MINIO_DOMAIN Configuration
+```yaml
+minio:
+  environment:
+    MINIO_DOMAIN: localhost
+    MINIO_SERVER_URL: http://localhost:9000
+```
+Why it failed: Still used minio:9000 for presigned URLs.
+
+Working Solution: Docker Host Gateway Routing
+
+Key insight: Make the API container access MinIO via localhost:9000 using
+Docker's host-gateway feature. This way, MinIO generates URLs with localhost:9000
+and both API and browser use the same endpoint.
+
+Implementation:
+
+1. Map localhost inside container to host gateway:
+```yaml
+# docker-compose.yml
+api:
+  environment:
+    MINIO_ENDPOINT: localhost:9000  # Changed from minio:9000
+    MINIO_EXTERNAL_ENDPOINT: localhost:9000
+  extra_hosts:
+    - "localhost:host-gateway"  # Maps localhost to host machine
+
+worker:
+  environment:
+    MINIO_ENDPOINT: localhost:9000
+    MINIO_EXTERNAL_ENDPOINT: localhost:9000
+  extra_hosts:
+    - "localhost:host-gateway"
+```
+
+2. MinIO continues to expose port 9000 to host:
+```yaml
+minio:
+  ports:
+    - "9000:9000"  # Already exposed
+```
+
+3. Simplified storage client (removed replacement logic):
+```python
+# api/app/storage.py
+def generate_presigned_upload_url(cls, bucket, object_key, expires):
+    client = cls.get_client()
+    url = client.presigned_put_object(bucket, object_key, expires)
+    # No replacement needed - URL already has localhost:9000
+    return url
+```
+
+How It Works:
+
+```
+Browser Request Flow:
+Browser → PUT http://localhost:9000/uploads/... → Host MinIO (port 9000)
+
+API Request Flow:
+API Container → localhost → host-gateway → Host Machine → MinIO (port 9000)
+
+URL Generation:
+MinIO Client (in API) → Minio(endpoint="localhost:9000") →
+presigned_put_object() → URL with Host: localhost:9000 →
+Signature calculated with Host: localhost:9000 ✓
+
+URL Validation:
+Browser → PUT to localhost:9000 → MinIO receives with Host: localhost:9000 →
+Signature validates ✓
+```
+
+Files Modified:
+- docker-compose.yml (lines 160-180, 204-220)
+- api/app/storage.py (simplified URL generation)
+- .env.local (added MINIO_EXTERNAL_ENDPOINT)
+
+Commands to Apply:
+```bash
+# Recreate containers to pick up new environment
+docker compose up -d api worker
+
+# Verify environment
+docker compose exec api printenv | grep MINIO
+# Output:
+# MINIO_ENDPOINT=localhost:9000
+# MINIO_EXTERNAL_ENDPOINT=localhost:9000
+```
+
+Verification:
+```bash
+# Check API logs for presigned URL
+docker compose logs api | grep "presigned"
+# Output: URL contains http://localhost:9000/uploads/...
+
+# Test upload from browser
+# Result: 200 OK, file uploaded successfully
+```
+
+Alternative Approaches Considered:
+
+1. Use Nginx reverse proxy
+   - Pros: Standard pattern, works in production
+   - Cons: Added complexity for development
+
+2. Configure MinIO with multiple aliases
+   - Pros: MinIO feature designed for this
+   - Cons: Complex setup, aliases limited
+
+3. Use host.docker.internal instead of localhost
+   - Pros: Docker built-in hostname
+   - Cons: Not available on Linux by default
+
+Why host-gateway is best for development:
+- Simple configuration (one line)
+- No additional containers
+- Works on all platforms (Linux, macOS, Windows)
+- Mirrors production setup (all services use localhost)
+
+Lesson Learned:
+AWS Signature V4 requires the Host header to match exactly. When working with
+presigned URLs across network boundaries (Docker → Host → Browser), ensure all
+parties use the same hostname. Use Docker's host-gateway feature to enable
+containers to reach host-exposed ports via localhost.
+
+=============================================================================
+CONFIGURATION CHANGES SUMMARY
+=============================================================================
+
+File: docker-compose.yml
+```diff
+  api:
+    environment:
+-     MINIO_ENDPOINT: minio:9000
++     MINIO_ENDPOINT: localhost:9000
++     MINIO_EXTERNAL_ENDPOINT: localhost:9000
++   extra_hosts:
++     - "localhost:host-gateway"
+
+  worker:
+    environment:
+-     MINIO_ENDPOINT: minio:9000
++     MINIO_ENDPOINT: localhost:9000
++     MINIO_EXTERNAL_ENDPOINT: localhost:9000
++   extra_hosts:
++     - "localhost:host-gateway"
+
+  minio:
++   environment:
++     MINIO_DOMAIN: localhost
++     MINIO_SERVER_URL: http://localhost:9000
+```
+
+File: .env.local
+```diff
+  STORAGE_BACKEND=minio
+  MINIO_ENDPOINT=localhost:9000
++ MINIO_EXTERNAL_ENDPOINT=localhost:9000
+  MINIO_ACCESS_KEY=minioadmin
+  MINIO_SECRET_KEY=minioadmin
+```
+
+File: api/app/config.py
+```diff
+  # Object Storage
+  storage_backend: Literal["minio", "gcs"] = "minio"
+  minio_endpoint: str = "localhost:9000"
++ minio_external_endpoint: str = "localhost:9000"
+  minio_access_key: str = "minioadmin"
+  minio_secret_key: str = "minioadmin"
+```
+
+File: api/app/auth/routes.py
+```diff
+  @router.get("/me", response_model=UserResponse)
+  async def get_current_user_profile(
+      current_user: AuthUser = Depends(get_current_user),
+-     supabase: Client = Depends(get_supabase),
++     db: AsyncSession = Depends(get_db),
+  ):
+-     user = supabase.auth.get_user()
+-     if not user.user:
++     stmt = select(User).where(User.supabase_user_id == UUID(current_user.supabase_user_id))
++     result = await db.execute(stmt)
++     user = result.scalar_one_or_none()
++     if not user:
+          raise HTTPException(...)
+
+      return UserResponse(
+-         id=user.user.id,
+-         email=user.user.email or "",
++         id=current_user.supabase_user_id,
++         email=user.email,
+          ...
+      )
+```
+
+File: api/app/video/routes.py
+```diff
+- state=video.state.value,
++ state=video.state,
+
+- state=v.state.value,
++ state=v.state,
+
+- "stage": job.stage.value,
++ "stage": job.stage,
+
+- "state": job.state.value,
++ "state": job.state,
+```
+
+=============================================================================
+DEBUGGING TECHNIQUES USED
+=============================================================================
+
+1. Log Analysis
+   - docker compose logs api --tail 100
+   - Searched for SQL errors, stack traces
+   - Identified line numbers from tracebacks
+
+2. Database Inspection
+   - docker compose exec db psql -U heimdex -d heimdex -c "\d videos"
+   - Verified schema vs model definitions
+
+3. Container Environment Verification
+   - docker compose exec api printenv | grep MINIO
+   - Confirmed environment variables persisted
+
+4. Network Debugging
+   - Checked browser Network tab for actual URLs
+   - Examined presigned URL parameters
+   - Verified Host header in requests
+
+5. Incremental Testing
+   - Fixed one issue at a time
+   - Restarted containers after each change
+   - Verified each fix before moving to next issue
+
+=============================================================================
+FINAL VERIFICATION
+=============================================================================
+
+Test 1: Authentication
+✅ GET /auth/me returns 200 OK with user profile
+
+Test 2: Video Listing
+✅ GET /videos returns 200 OK with video array
+✅ Video objects include title, description, state fields
+
+Test 3: Video Upload Initialization
+✅ POST /videos/upload/init returns 201 Created
+✅ Response includes upload_url with localhost:9000
+
+Test 4: Video Upload to MinIO
+✅ PUT to presigned URL returns 200 OK
+✅ File uploaded to MinIO successfully
+✅ No 403 Forbidden errors
+
+=============================================================================
+LESSONS LEARNED & BEST PRACTICES
+=============================================================================
+
+1. Database Migrations
+   - Always run `alembic revision --autogenerate` after model changes
+   - Review generated migrations before applying
+   - Keep models and migrations in sync
+
+2. Enum Handling
+   - Document whether using native_enum=True or False
+   - Be consistent: either always use .value or never use it
+   - Consider using Python Enum for type safety
+
+3. Docker Networking
+   - Use host-gateway for accessing host services from containers
+   - Document internal vs external endpoints clearly
+   - Test network connectivity from inside containers
+
+4. Presigned URLs
+   - Understand signature calculation includes Host header
+   - Never modify presigned URLs after generation
+   - Ensure hostname consistency across all services
+
+5. Error Messages
+   - Read full stack traces, not just error summary
+   - Check line numbers in your actual code
+   - Verify assumptions with direct inspection
+
+6. Dependency Injection
+   - Don't re-authenticate when user is already authenticated
+   - Use local database as source of truth
+   - Avoid unnecessary external API calls
+
+=============================================================================
+PRODUCTION READINESS CHECKLIST
+=============================================================================
+
+Completed:
+✅ Authentication working end-to-end
+✅ Database schema matches models
+✅ Video uploads functional with presigned URLs
+✅ All enum serialization issues resolved
+✅ Docker networking configured correctly
+
+Remaining for Production:
+⚠️  MinIO configuration assumes localhost (dev only)
+⚠️  Need to configure GCS for production uploads
+⚠️  No retry logic for presigned URL failures
+⚠️  Missing upload progress tracking in backend
+⚠️  No cleanup of failed uploads
+
+Next Steps:
+1. Test upload completion endpoint (/videos/upload/complete)
+2. Verify worker picks up processing jobs
+3. Test video download presigned URLs
+4. Add error handling for network failures
+5. Implement upload cleanup cron job
+
+=============================================================================
+TIME BREAKDOWN
+=============================================================================
+
+Problem 1 (Auth endpoint): 5 minutes
+- Identified issue in logs
+- Changed from Supabase to DB query
+- Added missing imports
+
+Problem 2 (Missing columns): 8 minutes
+- Created migration file
+- Ran migration via docker compose
+- Verified schema with psql
+
+Problem 3 (Enum errors): 3 minutes
+- Found all .value occurrences with grep
+- Removed .value calls (4 locations)
+- Verified API restart
+
+Problem 4 (Presigned URLs): 17 minutes
+- Attempted string replacement (failed)
+- Tried MINIO_SERVER_URL (failed)
+- Researched AWS signature V4
+- Implemented host-gateway solution
+- Recreated containers
+- Verified upload works
+
+Total: 33 minutes
+
+=============================================================================
+REFERENCES
+=============================================================================
+
+- AWS Signature Version 4: https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
+- MinIO Presigned URLs: https://min.io/docs/minio/linux/developers/python/API.html#presigned_put_object
+- Docker host-gateway: https://docs.docker.com/compose/compose-file/compose-file-v3/#extra_hosts
+- SQLAlchemy Enums: https://docs.sqlalchemy.org/en/20/core/type_basics.html#sqlalchemy.types.Enum
+- Alembic Migrations: https://alembic.sqlalchemy.org/en/latest/tutorial.html
+
+=============================================================================
+END OF SESSION
+=============================================================================
