@@ -45,7 +45,7 @@ def get_model_client() -> ModelServiceClient:
     if _model_client is None:
         model_service_url = os.getenv("MODEL_SERVICE_URL", "http://model-service:8001")
         print(f"[worker] Connecting to model service: {model_service_url}")
-        _model_client = ModelServiceClient(base_url=model_service_url, timeout=120.0)
+        _model_client = ModelServiceClient(base_url=model_service_url, timeout=600.0)
     return _model_client
 
 
@@ -179,10 +179,12 @@ def process_video(video_id_str: str):
     try:
         # Get video record
         from app.models.video import Video
+        from app.models.video_metadata import VideoMetadata
         from app.models.scene import Scene
         from app.models.job import Job
+        from sqlalchemy.orm import selectinload
 
-        video = session.query(Video).filter(Video.video_id == video_id).first()
+        video = session.query(Video).options(selectinload(Video.video_metadata)).filter(Video.video_id == video_id).first()
         if not video:
             raise ValueError(f"Video {video_id} not found")
 
@@ -266,14 +268,41 @@ def process_video(video_id_str: str):
                 # Generate text embedding via model service
                 # If no transcript, use video title as fallback so scene is still searchable
                 text_embedding = None
-                text_for_embedding = scene_transcript if scene_transcript else (video.title or "untitled video")
+                video_title = video.video_metadata.title if video.video_metadata else None
+                text_for_embedding = scene_transcript if scene_transcript else (video_title or "untitled video")
                 if text_for_embedding:
                     text_embedding = client.generate_text_embedding(text_for_embedding, model="siglip")
 
-                # Generate vision embedding (sample middle frame) via model service
+                # Generate vision embedding (sample multiple frames) via model service
+                # Sample 3 frames: 25%, 50%, 75% through the scene for better coverage
+                scene_duration = end_s - start_s
+                sample_times = [
+                    start_s + scene_duration * 0.25,  # 25% through
+                    start_s + scene_duration * 0.50,  # 50% through (middle)
+                    start_s + scene_duration * 0.75,  # 75% through
+                ]
+
+                # Generate embeddings for each sample and average them
+                frame_embeddings = []
+                for sample_time in sample_times:
+                    frame = extract_frame(str(video_path), sample_time)
+                    frame_emb = client.generate_vision_embedding(frame)
+                    if frame_emb is not None:
+                        frame_embeddings.append(frame_emb)
+
+                # Average the embeddings for more robust representation
+                if frame_embeddings:
+                    vision_embedding = np.mean(frame_embeddings, axis=0).astype(np.float32)
+                    # Re-normalize after averaging
+                    norm = np.linalg.norm(vision_embedding)
+                    if norm > 0:
+                        vision_embedding = vision_embedding / norm
+                else:
+                    vision_embedding = None
+
+                # Use middle frame for thumbnail and face detection
                 mid_time = (start_s + end_s) / 2
                 frame = extract_frame(str(video_path), mid_time)
-                vision_embedding = client.generate_vision_embedding(frame)
 
                 # Store frame for thumbnail generation
                 scene_frames[i] = frame

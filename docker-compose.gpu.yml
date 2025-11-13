@@ -1,0 +1,23 @@
+# Docker Compose GPU Override
+# Use this file to enable GPU support on systems with NVIDIA GPUs
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Prerequisites:
+#   - NVIDIA GPU with CUDA support
+#   - NVIDIA Docker runtime installed (nvidia-docker2)
+#   - Docker Compose v2.3+
+
+services:
+  model-service:
+    environment:
+      # Enable GPU for PyTorch
+      CUDA_VISIBLE_DEVICES: "0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

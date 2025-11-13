@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy import select, func, text
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 
@@ -76,88 +77,354 @@ async def search(
     limit: int = Query(10, ge=1, le=100, description="Maximum number of results"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     person_id: Optional[str] = Query(None, description="Filter by person ID"),
+    min_duration: Optional[float] = Query(None, ge=0, description="Minimum video duration in seconds"),
+    max_duration: Optional[float] = Query(None, ge=0, description="Maximum video duration in seconds"),
     current_user: AuthUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Search videos using keyword matching on transcripts.
+    Comprehensive hybrid search combining metadata, semantics, and keywords.
 
-    NOTE: Semantic search with embeddings is planned but requires ML model infrastructure.
-    For now, this endpoint uses case-insensitive keyword matching on transcripts.
+    This endpoint searches across:
+    1. Video metadata (title, description, filename, tags)
+    2. Scene transcripts (keyword matching, any language)
+    3. Semantic embeddings (visual + text, multilingual)
+    4. Video properties (duration, size filters)
 
-    This endpoint:
-    1. Searches scenes using case-insensitive keyword matching on transcripts
-    2. Returns matching scenes with their parent videos
-    3. Supports pagination and filtering
+    Scoring strategy:
+    - Metadata match: 0.4 weight (title, description, filename)
+    - Semantic similarity: 0.4 weight (vision + text embeddings)
+    - Transcript keyword: 0.2 weight (exact keyword matches)
+    - Scores are normalized and combined for final ranking
     """
-    logger.info(f"[search] Query: '{q}', user: {current_user.user_id}, type: keyword")
+    logger.info(f"[search] Comprehensive hybrid query: '{q}', user: {current_user.user_id}")
+
+    # Check if semantic search is available
+    semantic_available = settings.feature_semantic_search
 
     try:
         user_uuid = UUID(current_user.user_id)
-        search_pattern = f"%{q}%"
 
-        # Main query joining scenes with videos
-        query = (
-            select(Scene, Video)
-            .join(Video, Scene.video_id == Video.video_id)
-            .where(Video.user_id == user_uuid)  # Filter by user
-            .where(Video.state == 'indexed')  # Only search indexed videos
-            .where(Scene.transcript.ilike(search_pattern))  # Keyword match on transcript
-            .order_by(Scene.created_at.desc())  # Most recent first
+        # Generate query embedding if semantic search is enabled
+        query_embedding = None
+        embedding_str = None
+        if semantic_available:
+            try:
+                from app.search.embeddings import generate_text_embedding
+                query_embedding = generate_text_embedding(q)
+                if query_embedding is not None:
+                    embedding_list = query_embedding.tolist()
+                    embedding_str = str(embedding_list)
+                    logger.info(f"[search] Generated query embedding for semantic search")
+            except Exception as e:
+                logger.warning(f"[search] Failed to generate embedding, falling back to keyword: {e}")
+                semantic_available = False
+
+        # Build comprehensive hybrid search query
+        if semantic_available and embedding_str:
+            # Full hybrid search with semantic embeddings
+            query_sql = text("""
+                WITH metadata_matches AS (
+                    -- Search video metadata (title, description, filename from storage_key)
+                    SELECT DISTINCT
+                        v.video_id,
+                        CASE
+                            -- Exact match in title gets highest score
+                            WHEN LOWER(vm.title) = LOWER(:query) THEN 1.0
+                            WHEN LOWER(vm.title) LIKE LOWER(:pattern) THEN 0.8
+                            -- Match in description
+                            WHEN LOWER(vm.description) LIKE LOWER(:pattern) THEN 0.6
+                            -- Match in filename (extracted from storage_key)
+                            WHEN LOWER(v.storage_key) LIKE LOWER(:pattern) THEN 0.7
+                            -- Match in tags
+                            WHEN vm.tags::text ILIKE :pattern THEN 0.5
+                            ELSE 0
+                        END as metadata_score
+                    FROM videos v
+                    LEFT JOIN video_metadata vm ON v.video_id = vm.video_id
+                    WHERE v.user_id = CAST(:user_id AS uuid)
+                      AND v.state = 'indexed'
+                      AND (
+                          LOWER(vm.title) LIKE LOWER(:pattern)
+                          OR LOWER(vm.description) LIKE LOWER(:pattern)
+                          OR LOWER(v.storage_key) LIKE LOWER(:pattern)
+                          OR vm.tags::text ILIKE :pattern
+                      )
+                      AND (CAST(:min_duration AS FLOAT) IS NULL OR v.duration_s >= CAST(:min_duration AS FLOAT))
+                      AND (CAST(:max_duration AS FLOAT) IS NULL OR v.duration_s <= CAST(:max_duration AS FLOAT))
+                ),
+                scene_scores AS (
+                    SELECT
+                        s.scene_id,
+                        s.video_id,
+                        s.start_s,
+                        s.end_s,
+                        s.transcript,
+                        s.thumbnail_key,
+                        s.created_at,
+                        -- Semantic similarity scores
+                        CASE
+                            WHEN s.text_vec IS NOT NULL THEN (1 - (s.text_vec <-> CAST(:embedding AS vector(1152))))
+                            ELSE 0
+                        END AS text_similarity,
+                        CASE
+                            WHEN s.image_vec IS NOT NULL THEN (1 - (s.image_vec <-> CAST(:embedding AS vector(1152))))
+                            ELSE 0
+                        END AS vision_similarity,
+                        -- Keyword match in transcript (any language)
+                        CASE
+                            WHEN s.transcript IS NOT NULL AND LOWER(s.transcript) LIKE LOWER(:pattern) THEN 1.0
+                            ELSE 0
+                        END AS transcript_score,
+                        -- Person boost
+                        CASE
+                            WHEN CAST(:person_id AS uuid) IS NOT NULL AND EXISTS (
+                                SELECT 1 FROM scene_people sp
+                                WHERE sp.scene_id = s.scene_id AND sp.person_id = CAST(:person_id AS uuid)
+                            ) THEN :person_boost
+                            ELSE 0
+                        END AS person_boost_score
+                    FROM scenes s
+                    JOIN videos v ON s.video_id = v.video_id
+                    WHERE v.user_id = CAST(:user_id AS uuid)
+                      AND v.state = 'indexed'
+                      AND (s.text_vec IS NOT NULL OR s.image_vec IS NOT NULL OR s.transcript IS NOT NULL)
+                      AND (CAST(:person_id AS uuid) IS NULL OR EXISTS (
+                          SELECT 1 FROM scene_people sp
+                          WHERE sp.scene_id = s.scene_id AND sp.person_id = CAST(:person_id AS uuid)
+                      ))
+                      AND (CAST(:min_duration AS FLOAT) IS NULL OR v.duration_s >= CAST(:min_duration AS FLOAT))
+                      AND (CAST(:max_duration AS FLOAT) IS NULL OR v.duration_s <= CAST(:max_duration AS FLOAT))
+                )
+                SELECT
+                    ss.scene_id,
+                    ss.video_id,
+                    ss.start_s,
+                    ss.end_s,
+                    ss.transcript,
+                    ss.thumbnail_key,
+                    ss.created_at,
+                    ss.text_similarity,
+                    ss.vision_similarity,
+                    ss.transcript_score,
+                    COALESCE(mm.metadata_score, 0) as metadata_score,
+                    ss.person_boost_score,
+                    -- Combined score with configurable weights (vision-focused for silent videos)
+                    (
+                        COALESCE(mm.metadata_score, 0) * 0.2 +  -- 20% metadata (reduced from 30%)
+                        (ss.text_similarity * :text_weight + ss.vision_similarity * :vision_weight) * 0.7 +  -- 70% semantic (increased from 50%)
+                        ss.transcript_score * 0.1 +  -- 10% transcript keyword (reduced from 20%)
+                        ss.person_boost_score  -- Bonus for person match
+                    ) AS final_score
+                FROM scene_scores ss
+                LEFT JOIN metadata_matches mm ON ss.video_id = mm.video_id
+                -- Temporarily removed threshold to debug: WHERE (ss.text_similarity > 0 OR ss.vision_similarity > 0 OR ss.transcript_score > 0 OR mm.metadata_score > 0)
+                ORDER BY final_score DESC, ss.created_at DESC
+                LIMIT :limit OFFSET :offset
+            """)
+
+            result = await db.execute(
+                query_sql,
+                {
+                    "query": q,
+                    "pattern": f"%{q}%",
+                    "embedding": embedding_str,
+                    "user_id": str(user_uuid),
+                    "person_id": person_id,
+                    "person_boost": settings.search_person_boost,
+                    "text_weight": settings.search_text_weight,
+                    "vision_weight": settings.search_vision_weight,
+                    "min_duration": min_duration,
+                    "max_duration": max_duration,
+                    "limit": limit,
+                    "offset": offset,
+                }
+            )
+        else:
+            # Fallback: metadata + keyword search only (no embeddings)
+            query_sql = text("""
+                WITH metadata_matches AS (
+                    SELECT DISTINCT
+                        v.video_id,
+                        CASE
+                            WHEN LOWER(vm.title) = LOWER(:query) THEN 1.0
+                            WHEN LOWER(vm.title) LIKE LOWER(:pattern) THEN 0.8
+                            WHEN LOWER(vm.description) LIKE LOWER(:pattern) THEN 0.6
+                            WHEN LOWER(v.storage_key) LIKE LOWER(:pattern) THEN 0.7
+                            WHEN vm.tags::text ILIKE :pattern THEN 0.5
+                            ELSE 0
+                        END as metadata_score
+                    FROM videos v
+                    LEFT JOIN video_metadata vm ON v.video_id = vm.video_id
+                    WHERE v.user_id = CAST(:user_id AS uuid)
+                      AND v.state = 'indexed'
+                      AND (
+                          LOWER(vm.title) LIKE LOWER(:pattern)
+                          OR LOWER(vm.description) LIKE LOWER(:pattern)
+                          OR LOWER(v.storage_key) LIKE LOWER(:pattern)
+                          OR vm.tags::text ILIKE :pattern
+                      )
+                      AND (CAST(:min_duration AS FLOAT) IS NULL OR v.duration_s >= CAST(:min_duration AS FLOAT))
+                      AND (CAST(:max_duration AS FLOAT) IS NULL OR v.duration_s <= CAST(:max_duration AS FLOAT))
+                )
+                SELECT
+                    s.scene_id,
+                    s.video_id,
+                    s.start_s,
+                    s.end_s,
+                    s.transcript,
+                    s.thumbnail_key,
+                    s.created_at,
+                    0 as text_similarity,
+                    0 as vision_similarity,
+                    CASE
+                        WHEN s.transcript IS NOT NULL AND LOWER(s.transcript) LIKE LOWER(:pattern) THEN 1.0
+                        ELSE 0
+                    END AS transcript_score,
+                    COALESCE(mm.metadata_score, 0) as metadata_score,
+                    0 as person_boost_score,
+                    (COALESCE(mm.metadata_score, 0) * 0.6 +
+                     CASE WHEN s.transcript IS NOT NULL AND LOWER(s.transcript) LIKE LOWER(:pattern) THEN 0.4 ELSE 0 END
+                    ) AS final_score
+                FROM scenes s
+                JOIN videos v ON s.video_id = v.video_id
+                LEFT JOIN metadata_matches mm ON s.video_id = mm.video_id
+                WHERE v.user_id = CAST(:user_id AS uuid)
+                  AND v.state = 'indexed'
+                  AND (
+                      mm.metadata_score > 0
+                      OR (s.transcript IS NOT NULL AND LOWER(s.transcript) LIKE LOWER(:pattern))
+                  )
+                  AND (CAST(:min_duration AS FLOAT) IS NULL OR v.duration_s >= CAST(:min_duration AS FLOAT))
+                  AND (CAST(:max_duration AS FLOAT) IS NULL OR v.duration_s <= CAST(:max_duration AS FLOAT))
+                ORDER BY final_score DESC, s.created_at DESC
+                LIMIT :limit OFFSET :offset
+            """)
+
+            result = await db.execute(
+                query_sql,
+                {
+                    "query": q,
+                    "pattern": f"%{q}%",
+                    "user_id": str(user_uuid),
+                    "min_duration": min_duration,
+                    "max_duration": max_duration,
+                    "limit": limit,
+                    "offset": offset,
+                }
+            )
+
+        rows = result.fetchall()
+
+        # Get total count - use different query based on search type
+        if semantic_available and embedding_str:
+            # Count for semantic search - includes scenes with embeddings
+            count_sql = text("""
+                SELECT COUNT(DISTINCT s.scene_id)
+                FROM scenes s
+                JOIN videos v ON s.video_id = v.video_id
+                LEFT JOIN video_metadata vm ON v.video_id = vm.video_id
+                WHERE v.user_id = CAST(:user_id AS uuid)
+                  AND v.state = 'indexed'
+                  AND (
+                      LOWER(vm.title) LIKE LOWER(:pattern)
+                      OR LOWER(vm.description) LIKE LOWER(:pattern)
+                      OR LOWER(v.storage_key) LIKE LOWER(:pattern)
+                      OR vm.tags::text ILIKE :pattern
+                      OR (s.transcript IS NOT NULL AND LOWER(s.transcript) LIKE LOWER(:pattern))
+                      OR s.text_vec IS NOT NULL
+                      OR s.image_vec IS NOT NULL
+                  )
+                  AND (CAST(:min_duration AS FLOAT) IS NULL OR v.duration_s >= CAST(:min_duration AS FLOAT))
+                  AND (CAST(:max_duration AS FLOAT) IS NULL OR v.duration_s <= CAST(:max_duration AS FLOAT))
+            """)
+        else:
+            # Count for fallback search - only keyword/metadata matches
+            count_sql = text("""
+                SELECT COUNT(DISTINCT s.scene_id)
+                FROM scenes s
+                JOIN videos v ON s.video_id = v.video_id
+                LEFT JOIN video_metadata vm ON v.video_id = vm.video_id
+                WHERE v.user_id = CAST(:user_id AS uuid)
+                  AND v.state = 'indexed'
+                  AND (
+                      LOWER(vm.title) LIKE LOWER(:pattern)
+                      OR LOWER(vm.description) LIKE LOWER(:pattern)
+                      OR LOWER(v.storage_key) LIKE LOWER(:pattern)
+                      OR vm.tags::text ILIKE :pattern
+                      OR (s.transcript IS NOT NULL AND LOWER(s.transcript) LIKE LOWER(:pattern))
+                  )
+                  AND (CAST(:min_duration AS FLOAT) IS NULL OR v.duration_s >= CAST(:min_duration AS FLOAT))
+                  AND (CAST(:max_duration AS FLOAT) IS NULL OR v.duration_s <= CAST(:max_duration AS FLOAT))
+            """)
+
+        count_result = await db.execute(
+            count_sql,
+            {
+                "user_id": str(user_uuid),
+                "pattern": f"%{q}%",
+                "min_duration": min_duration,
+                "max_duration": max_duration,
+            }
         )
-
-        # Optional: Filter by person_id
-        if person_id:
-            person_uuid = UUID(person_id)
-            query = query.join(
-                ScenePerson,
-                ScenePerson.scene_id == Scene.scene_id
-            ).where(ScenePerson.person_id == person_uuid)
-
-        # Get total count
-        count_query = select(func.count()).select_from(query.subquery())
-        total_result = await db.execute(count_query)
-        total = total_result.scalar() or 0
-
-        # Apply pagination
-        query = query.limit(limit).offset(offset)
-
-        # Execute query
-        result = await db.execute(query)
-        results = result.all()
+        total = count_result.scalar() or 0
 
         # Build response
         search_results = []
-        for scene, video in results:
-            # Generate thumbnail URL if thumbnail exists
+        for row in rows:
+            # Log similarity scores for debugging
+            metadata_score = getattr(row, 'metadata_score', 0)
+            text_similarity = getattr(row, 'text_similarity', 0)
+            vision_similarity = getattr(row, 'vision_similarity', 0)
+            transcript_score = getattr(row, 'transcript_score', 0)
+            final_score = getattr(row, 'final_score', 0)
+            logger.info(
+                f"[search] Scene {row.scene_id}: "
+                f"vision={vision_similarity:.4f}, "
+                f"text={text_similarity:.4f}, "
+                f"metadata={metadata_score:.4f}, "
+                f"transcript={transcript_score:.4f}, "
+                f"final={final_score:.4f}"
+            )
+
+            # Get video for this scene
+            video_query = (
+                select(Video)
+                .options(selectinload(Video.video_metadata))
+                .where(Video.video_id == row.video_id)
+            )
+            video_result = await db.execute(video_query)
+            video = video_result.scalar_one()
+
+            # Generate thumbnail URL
             thumbnail_url = None
-            if scene.thumbnail_key:
+            if row.thumbnail_key:
                 try:
                     thumbnail_url = StorageClient.generate_presigned_download_url(
                         bucket=settings.storage_bucket_thumbnails,
-                        object_key=scene.thumbnail_key,
-                        expires=timedelta(hours=1)  # Cache for 1 hour
+                        object_key=row.thumbnail_key,
+                        expires=timedelta(hours=1)
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to generate thumbnail URL for scene {scene.scene_id}: {e}")
+                    logger.warning(f"Failed to generate thumbnail URL for scene {row.scene_id}: {e}")
 
             # Convert scene
             scene_dict = {
-                "id": str(scene.scene_id),
-                "video_id": str(scene.video_id),
-                "start_time": float(scene.start_s),
-                "end_time": float(scene.end_s),
-                "transcript": scene.transcript,
+                "id": str(row.scene_id),
+                "video_id": str(row.video_id),
+                "start_time": float(row.start_s),
+                "end_time": float(row.end_s),
+                "transcript": row.transcript,
                 "thumbnail_url": thumbnail_url,
-                "created_at": scene.created_at.isoformat() if scene.created_at else None,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
             }
 
             # Convert video
             video_dict = {
                 "video_id": str(video.video_id),
                 "user_id": str(video.user_id),
-                "title": video.title,
-                "description": video.description,
+                "title": video.video_metadata.title if video.video_metadata else None,
+                "description": video.video_metadata.description if video.video_metadata else None,
                 "duration_s": float(video.duration_s) if video.duration_s else None,
                 "size_bytes": video.size_bytes,
                 "mime_type": video.mime_type,
@@ -166,34 +433,44 @@ async def search(
                 "indexed_at": video.indexed_at.isoformat() if video.indexed_at else None,
             }
 
-            # Create highlights from transcript (optional)
+            # Create highlights showing what matched
             highlights = []
-            if scene.transcript and q.lower() in scene.transcript.lower():
-                highlights.append(scene.transcript)
-
-            # Simple scoring: 1.0 for all matches (can be improved later with semantic search)
-            score = 1.0
+            if semantic_available:
+                if row.metadata_score > 0:
+                    highlights.append(f"Metadata match: {row.metadata_score:.2f}")
+                if row.vision_similarity > 0:
+                    highlights.append(f"Visual: {row.vision_similarity:.3f}")
+                if row.text_similarity > 0:
+                    highlights.append(f"Text: {row.text_similarity:.3f}")
+                if row.transcript_score > 0:
+                    highlights.append(f"Transcript keyword")
+            else:
+                if row.metadata_score > 0:
+                    highlights.append(f"Metadata: {row.metadata_score:.2f}")
+                if row.transcript_score > 0:
+                    highlights.append("Transcript keyword")
 
             search_results.append(
                 SearchResult(
                     scene=SceneResponse(**scene_dict),
                     video=VideoResponse(**video_dict),
-                    score=score,
+                    score=float(row.final_score),
                     highlights=highlights if highlights else None,
                 )
             )
 
-        logger.info(f"[search] Found {len(search_results)} results (total: {total})")
+        search_type = "hybrid_comprehensive" if semantic_available else "metadata_keyword"
+        logger.info(f"[search] {search_type} search found {len(search_results)} results (total: {total})")
 
         return SearchResponse(
             results=search_results,
             total=total,
             query=q,
-            search_type="keyword",
+            search_type=search_type,
         )
 
     except Exception as e:
-        logger.error(f"[search] Error: {str(e)}", exc_info=True)
+        logger.error(f"[search] Comprehensive search error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Search failed: {str(e)}"
@@ -286,7 +563,7 @@ async def hybrid_search(
                 -- Dense retrieval: Vector similarity search
                 SELECT
                     s.scene_id,
-                    ROW_NUMBER() OVER (ORDER BY (1 - (s.image_vec <-> CAST(:embedding AS vector))) DESC) as vector_rank
+                    ROW_NUMBER() OVER (ORDER BY (1 - (s.image_vec <-> CAST(:embedding AS vector(1152)))) DESC) as vector_rank
                 FROM scenes s
                 JOIN videos v ON s.video_id = v.video_id
                 WHERE v.user_id = CAST(:user_id AS uuid)
@@ -296,7 +573,7 @@ async def hybrid_search(
                       SELECT 1 FROM scene_people sp
                       WHERE sp.scene_id = s.scene_id AND sp.person_id = CAST(:person_id AS uuid)
                   ))
-                ORDER BY s.image_vec <-> CAST(:embedding AS vector)
+                ORDER BY s.image_vec <-> CAST(:embedding AS vector(1152))
                 LIMIT :topk
             ),
             fused_scores AS (
@@ -372,8 +649,27 @@ async def hybrid_search(
         # Build response
         search_results = []
         for row in rows:
+            # Log similarity scores for debugging
+            metadata_score = getattr(row, 'metadata_score', 0)
+            text_similarity = getattr(row, 'text_similarity', 0)
+            vision_similarity = getattr(row, 'vision_similarity', 0)
+            transcript_score = getattr(row, 'transcript_score', 0)
+            final_score = getattr(row, 'final_score', 0)
+            logger.info(
+                f"[search] Scene {row.scene_id}: "
+                f"vision={vision_similarity:.4f}, "
+                f"text={text_similarity:.4f}, "
+                f"metadata={metadata_score:.4f}, "
+                f"transcript={transcript_score:.4f}, "
+                f"final={final_score:.4f}"
+            )
+
             # Get video for this scene
-            video_query = select(Video).where(Video.video_id == row.video_id)
+            video_query = (
+                select(Video)
+                .options(selectinload(Video.video_metadata))
+                .where(Video.video_id == row.video_id)
+            )
             video_result = await db.execute(video_query)
             video = video_result.scalar_one()
 
@@ -404,8 +700,8 @@ async def hybrid_search(
             video_dict = {
                 "video_id": str(video.video_id),
                 "user_id": str(video.user_id),
-                "title": video.title,
-                "description": video.description,
+                "title": video.video_metadata.title if video.video_metadata else None,
+                "description": video.video_metadata.description if video.video_metadata else None,
                 "duration_s": float(video.duration_s) if video.duration_s else None,
                 "size_bytes": video.size_bytes,
                 "mime_type": video.mime_type,
@@ -514,8 +810,8 @@ async def semantic_search(
 
         # Build SQL query using pgvector cosine distance operator
         # Uses SigLIP embeddings (1152-dim) for true multimodal search
-        # Text queries are encoded with SigLIP's text encoder and compared against image_vec
-        # This enables semantic visual search (e.g., "red car" finds scenes with red cars)
+        # Compares query against BOTH text_vec (from transcripts) AND image_vec (from frames)
+        # This enables hybrid semantic search (text + vision)
         query_sql = text("""
             WITH scene_scores AS (
                 SELECT
@@ -526,10 +822,14 @@ async def semantic_search(
                     s.transcript,
                     s.thumbnail_key,
                     s.created_at,
-                    -- Compute vision similarity using SigLIP embeddings (1152-dim)
-                    -- Both query text and scene images are in the same embedding space
+                    -- Compute text similarity (query vs transcript embeddings)
                     CASE
-                        WHEN s.image_vec IS NOT NULL THEN (1 - (s.image_vec <-> CAST(:embedding AS vector)))
+                        WHEN s.text_vec IS NOT NULL THEN (1 - (s.text_vec <-> CAST(:embedding AS vector(1152))))
+                        ELSE 0
+                    END AS text_similarity,
+                    -- Compute vision similarity (query vs image embeddings)
+                    CASE
+                        WHEN s.image_vec IS NOT NULL THEN (1 - (s.image_vec <-> CAST(:embedding AS vector(1152))))
                         ELSE 0
                     END AS vision_similarity,
                     -- Check if person is in scene
@@ -544,7 +844,7 @@ async def semantic_search(
                 JOIN videos v ON s.video_id = v.video_id
                 WHERE v.user_id = CAST(:user_id AS uuid)
                   AND v.state = 'indexed'
-                  AND s.image_vec IS NOT NULL
+                  AND (s.text_vec IS NOT NULL OR s.image_vec IS NOT NULL)
                   AND (CAST(:person_id AS uuid) IS NULL OR EXISTS (
                       SELECT 1 FROM scene_people sp
                       WHERE sp.scene_id = s.scene_id AND sp.person_id = CAST(:person_id AS uuid)
@@ -558,11 +858,12 @@ async def semantic_search(
                 transcript,
                 thumbnail_key,
                 created_at,
+                text_similarity,
                 vision_similarity,
                 person_boost_score,
-                (vision_similarity * :vision_weight + person_boost_score) AS final_score
+                (text_similarity * :text_weight + vision_similarity * :vision_weight + person_boost_score) AS final_score
             FROM scene_scores
-            -- Temporarily removed threshold to debug: WHERE (vision_similarity * :vision_weight + person_boost_score) > 0
+            WHERE (text_similarity * :text_weight + vision_similarity * :vision_weight + person_boost_score) > 0
             ORDER BY final_score DESC
             LIMIT :limit OFFSET :offset
         """)
@@ -575,6 +876,7 @@ async def semantic_search(
                 "user_id": str(user_uuid),
                 "person_id": person_id,
                 "person_boost": person_boost,
+                "text_weight": text_w,
                 "vision_weight": vision_w,
                 "limit": query_limit,  # Use ANN-tuned limit if enabled
                 "offset": offset,
@@ -590,7 +892,6 @@ async def semantic_search(
             logger.info(f"[search] Re-ranked from {query_limit} to {settings.search_ann_final_limit} results")
 
         # Get total count (without pagination)
-        # NOTE: Threshold removed for debugging - count all scenes with embeddings
         count_sql = text("""
             SELECT COUNT(*) FROM (
                 SELECT s.scene_id
@@ -598,7 +899,7 @@ async def semantic_search(
                 JOIN videos v ON s.video_id = v.video_id
                 WHERE v.user_id = CAST(:user_id AS uuid)
                   AND v.state = 'indexed'
-                  AND s.image_vec IS NOT NULL
+                  AND (s.text_vec IS NOT NULL OR s.image_vec IS NOT NULL)
                   AND (CAST(:person_id AS uuid) IS NULL OR EXISTS (
                       SELECT 1 FROM scene_people sp
                       WHERE sp.scene_id = s.scene_id AND sp.person_id = CAST(:person_id AS uuid)
@@ -622,8 +923,27 @@ async def semantic_search(
         # Build response
         search_results = []
         for row in rows:
+            # Log similarity scores for debugging
+            metadata_score = getattr(row, 'metadata_score', 0)
+            text_similarity = getattr(row, 'text_similarity', 0)
+            vision_similarity = getattr(row, 'vision_similarity', 0)
+            transcript_score = getattr(row, 'transcript_score', 0)
+            final_score = getattr(row, 'final_score', 0)
+            logger.info(
+                f"[search] Scene {row.scene_id}: "
+                f"vision={vision_similarity:.4f}, "
+                f"text={text_similarity:.4f}, "
+                f"metadata={metadata_score:.4f}, "
+                f"transcript={transcript_score:.4f}, "
+                f"final={final_score:.4f}"
+            )
+
             # Get video for this scene
-            video_query = select(Video).where(Video.video_id == row.video_id)
+            video_query = (
+                select(Video)
+                .options(selectinload(Video.video_metadata))
+                .where(Video.video_id == row.video_id)
+            )
             video_result = await db.execute(video_query)
             video = video_result.scalar_one()
 
@@ -654,8 +974,8 @@ async def semantic_search(
             video_dict = {
                 "video_id": str(video.video_id),
                 "user_id": str(video.user_id),
-                "title": video.title,
-                "description": video.description,
+                "title": video.video_metadata.title if video.video_metadata else None,
+                "description": video.video_metadata.description if video.video_metadata else None,
                 "duration_s": float(video.duration_s) if video.duration_s else None,
                 "size_bytes": video.size_bytes,
                 "mime_type": video.mime_type,

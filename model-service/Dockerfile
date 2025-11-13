@@ -1,7 +1,7 @@
 # Model Service Dockerfile
-# Optimized for production ML inference with GPU support
+# Platform-agnostic ML inference with CPU/GPU support
 
-FROM pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
@@ -18,18 +18,25 @@ RUN apt-get update && apt-get install -y --fix-missing \
     libxext6 \
     libxrender-dev \
     libgomp1 \
+    libglib2.0-0 \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (layer caching)
 COPY requirements.txt .
 
 # Install Python dependencies
+# Note: torch will auto-detect CPU vs CUDA at runtime
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir git+https://github.com/openai/whisper.git
 
 # Copy application code
 COPY app/ ./app/
+
+# Create models directory with proper permissions
+RUN mkdir -p /app/models/.cache && \
+    chmod -R 777 /app/models
 
 # Expose port
 EXPOSE 8001

@@ -31,6 +31,10 @@ export function RegisterForm() {
       if (!response.access_token) {
         setSuccess('Registration successful! Please check your email to confirm your account.');
       } else {
+        // Store tokens in localStorage for subsequent requests
+        localStorage.setItem('access_token', response.access_token);
+        localStorage.setItem('refresh_token', response.refresh_token);
+
         setUser(response.user);
         router.push('/dashboard');
       }

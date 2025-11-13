@@ -1,0 +1,428 @@
+# Devlog: Fixed Worker Missing Models Directory
+Date: 2025-11-12 14:15
+Session Type: Bug Fix
+Status: ✅ RESOLVED
+
+## Session Overview
+
+Fixed worker container failing to import ORM models because the `worker/app/models/` directory didn't exist. Copied models from `api/app/models/` to `worker/app/models/` so both containers share the same ORM definitions.
+
+### Files Modified
+None (directory copied)
+
+### Directories Created
+- worker/app/models/ (copied from api/app/models/)
+
+## Issue Encountered
+
+### Error Message
+```
+ModuleNotFoundError: No module named 'app.models'
+```
+
+### Context
+- User uploaded a video via `/videos/upload/init` endpoint
+- API queued video processing task to worker
+- Worker tried to process video but failed immediately
+- Worker code tried to import `from app.models.video import Video`
+- Import failed because worker container had no `app/models` directory
+- Video processing failed and exhausted retries
+
+### Stack Trace Location
+```
+File "/app/tasks/video_processor.py", line 181, in process_video
+    from app.models.video import Video
+ModuleNotFoundError: No module named 'app.models'
+```
+
+## Root Cause Analysis
+
+### The Problem
+
+The project has two separate containers that both need access to ORM models:
+
+1. **API container** (`api/`)
+   - Has models in `api/app/models/`
+   - Can import `from app.models.video import Video` ✓
+   - Uses models for HTTP request handlers
+
+2. **Worker container** (`worker/`)
+   - Has its own `worker/app/` directory
+   - Had NO `worker/app/models/` directory ✗
+   - Uses models for background job processing
+   - Tried to import `from app.models.video import Video` - FAILED
+
+### Directory Structure
+
+**Before Fix:**
+
+```
+api/
+  app/
+    models/          ← Models here
+      __init__.py
+      video.py
+      user.py
+      job.py
+      scene.py
+      ...
+
+worker/
+  app/
+    config.py
+    db.py
+    logging_config.py
+    # NO MODELS DIRECTORY!  ← Problem
+  tasks/
+    video_processor.py    ← Tries to import from app.models
+```
+
+**After Fix:**
+
+```
+api/
+  app/
+    models/          ← Original models
+      ...
+
+worker/
+  app/
+    models/          ← Copied models
+      __init__.py
+      video.py
+      user.py
+      job.py
+      scene.py
+      ...
+  tasks/
+    video_processor.py    ← Can now import from app.models ✓
+```
+
+### Why This Happened
+
+1. **Separate containers:** API and worker are separate Docker containers with separate code
+2. **No shared volume:** Models aren't shared via volume mount between containers
+3. **Worker imports models:** Worker code expects to import `from app.models` but directory didn't exist
+4. **Not caught earlier:** This error only happens during video processing, which wasn't tested until now
+
+### Design Decision
+
+The project uses a **multi-container architecture**:
+- `api` container: HTTP API (FastAPI)
+- `worker` container: Background jobs (Dramatiq)
+- Both need the same ORM models to read/write database
+
+Options for sharing models:
+1. ✅ **Copy models to both containers** (chosen solution)
+   - Simple and explicit
+   - Each container has all code it needs
+   - Clear ownership
+
+2. ❌ Mount api directory as volume in worker
+   - Coupling between containers
+   - Worker would depend on api directory structure
+
+3. ❌ Create separate shared package
+   - Over-engineering for current scale
+   - Would need to manage as separate package
+
+## Solution
+
+### Changes Made
+
+**Copied models directory from API to worker:**
+
+```bash
+cp -r api/app/models worker/app/
+```
+
+This copied all model files:
+- `__init__.py` - Exports all models
+- `base.py` - SQLAlchemy Base class
+- `video.py` - Video ORM model
+- `video_metadata.py` - VideoMetadata ORM model
+- `user.py` - User ORM model
+- `job.py` - Job ORM model
+- `scene.py` - Scene ORM model
+- `face.py` - Face-related ORM models
+- `auth.py` - Auth ORM models
+- `audit.py` - Audit ORM models
+
+### Verification
+
+1. Verified models copied:
+   ```bash
+   ls -la worker/app/models/
+   ```
+
+2. Restarted worker:
+   ```bash
+   docker compose restart worker
+   ```
+
+3. Confirmed worker started successfully:
+   ```
+   [dramatiq.WorkerProcess(0)] [INFO] Worker process is ready for action.
+   ```
+
+4. Tested import inside worker container:
+   ```bash
+   docker compose exec worker python -c "from app.models.video import Video; print('✓ Import successful')"
+   ```
+   Result: ✓ Import successful
+
+## Key Patterns Learned
+
+### 1. Multi-Container Model Sharing
+
+When multiple containers need the same ORM models:
+
+**Option A: Copy models to each container** (our approach)
+```dockerfile
+# api/Dockerfile
+COPY api/app/ /app/app/
+
+# worker/Dockerfile
+COPY api/app/models/ /app/app/models/  # Copy just models
+COPY worker/ /app/
+```
+
+**Option B: Shared package**
+```
+shared/
+  models/
+    __init__.py
+    video.py
+    ...
+
+# Both containers copy shared/
+```
+
+**Option C: Volume mount** (not recommended)
+```yaml
+# docker-compose.yml
+worker:
+  volumes:
+    - ./api/app/models:/app/app/models:ro  # Read-only
+```
+
+### 2. Volume Mount Behavior
+
+The worker has a volume mount:
+```yaml
+worker:
+  volumes:
+    - ./worker:/app  # Host ./worker → Container /app
+```
+
+This means:
+- Files copied to `./worker/app/models/` on host
+- Immediately available in container at `/app/app/models/`
+- No rebuild needed, just restart
+
+### 3. Import Path Considerations
+
+Worker code imports:
+```python
+from app.models.video import Video  # Looks for /app/app/models/video.py
+```
+
+Container working directory is `/app`, so:
+- `app` = `/app/app` ✓
+- `app.models` = `/app/app/models` ✓
+- `app.models.video` = `/app/app/models/video.py` ✓
+
+All paths relative to working directory.
+
+### 4. Testing Imports in Container
+
+Quick test for import issues:
+```bash
+# Test if module can be imported
+docker compose exec <service> python -c "import <module>; print('OK')"
+
+# Example
+docker compose exec worker python -c "from app.models.video import Video; print('OK')"
+```
+
+If import fails, check:
+1. Does file exist at expected path?
+2. Is `__init__.py` present in package?
+3. Is PYTHONPATH set correctly?
+4. Are there circular import issues?
+
+### 5. Dramatiq Worker Error Handling
+
+Dramatiq retry behavior:
+- Failed tasks are automatically retried
+- Default: 20 retries with exponential backoff
+- After max retries: Message logged and discarded
+- **No automatic re-queue after exhaustion**
+
+To reprocess after fixing:
+1. Upload new video (gets new job)
+2. Or manually create new job for failed video
+3. Or implement dead letter queue for manual review
+
+## Previous Video Processing
+
+The video uploaded before this fix (video_id: `ad6c975e-ae1d-45ec-875e-70c805851e7e`) failed with:
+```
+[dramatiq.middleware.retries.Retries] [WARNING] Retries exceeded for message 'ad098d37-5722-4cc8-bc79-7160172d556e'.
+```
+
+This video will NOT be automatically reprocessed because:
+- ❌ Retries exhausted
+- ❌ Job marked as failed in database
+- ❌ No automatic retry after max attempts
+
+To process this video:
+1. User can re-upload the video (easiest)
+2. Or we can manually create a new job for the video
+
+## Related Devlogs
+
+**Recent fixes in this session:**
+1. devlogs/2511121347.txt - Fixed enum values_callable
+2. devlogs/2511121357.txt - Created VideoMetadata model
+3. devlogs/2511121407.txt - Updated route handlers for VideoMetadata
+4. devlogs/2511121410.txt - Fixed enum type names
+5. devlogs/2511121415.txt - Fixed worker missing models (this devlog)
+
+**Context:**
+This completes the end-to-end video upload and processing pipeline fixes. The system should now:
+- ✅ Accept video uploads (API working)
+- ✅ Queue processing jobs (API → Redis → Worker)
+- ✅ Process videos (Worker can now import models)
+
+## Status
+
+**Issue**: ✅ RESOLVED
+**Risk Level**: 🟢 LOW - Standard directory copy operation
+**Confidence**: 🟢 HIGH - Import verified in container
+
+**Testing Status**:
+- ✅ Worker starts without errors
+- ✅ Models directory exists in worker container
+- ✅ Import test succeeds
+- ⏳ End-to-end video processing (requires new upload)
+
+## Maintenance Considerations
+
+### Model Synchronization
+
+**Important:** Now that models exist in TWO locations, they must be kept in sync!
+
+**When you modify a model:**
+1. Edit the model in `api/app/models/`
+2. Copy changes to `worker/app/models/`
+3. Restart both API and worker containers
+
+**Better long-term solution:**
+- Create a `shared/models/` directory
+- Update both Dockerfiles to copy from `shared/models/`
+- Models exist in ONE source location
+- Copied to both containers during build
+
+**Recommended future structure:**
+```
+shared/
+  models/              ← Single source of truth
+    __init__.py
+    video.py
+    ...
+
+api/
+  Dockerfile           ← COPY shared/models/ /app/app/models/
+  app/
+    (no models here)
+
+worker/
+  Dockerfile           ← COPY shared/models/ /app/app/models/
+  app/
+    (no models here)
+```
+
+### Alternative: Shared Package
+
+For larger projects, consider:
+1. Create `shared/` as a Python package
+2. Install in both containers via `pip install -e ./shared`
+3. Both import `from shared.models import Video`
+
+Benefits:
+- Single source of truth
+- Version control
+- Explicit dependency
+- Can be published to package registry
+
+## Next Steps for User
+
+1. **Upload a new video** - Previous video failed and won't retry automatically:
+   ```bash
+   POST /videos/upload/init
+   {
+     "filename": "test.mp4",
+     "mime_type": "video/mp4",
+     "size_bytes": 1024000,
+     "title": "Test Video",
+     "description": "Testing processing pipeline"
+   }
+   ```
+
+2. **Monitor worker logs** to see processing progress:
+   ```bash
+   docker compose logs -f worker
+   ```
+
+3. **Check video status** via API:
+   ```bash
+   GET /videos/{video_id}/status
+   ```
+
+4. **Expected processing stages:**
+   - `uploading` → `validating` → `processing` → `indexed`
+   - Or `failed` if errors occur
+
+5. **If processing fails**, check worker logs for specific errors and create new devlog
+
+## Lessons Learned
+
+### 1. Test Background Jobs Early
+
+We didn't discover this issue until video upload, which triggers background processing. Earlier testing of worker imports would have caught this.
+
+**Recommendation:** Add worker import test to CI/CD:
+```bash
+docker compose exec worker python -c "from app.models import Video, User, Job"
+```
+
+### 2. Shared Code Needs Shared Storage
+
+When multiple services need the same code:
+- ✓ Identify shared dependencies early
+- ✓ Decide on sharing strategy (copy vs mount vs package)
+- ✓ Document in architecture docs
+- ✗ Don't discover by accident in production
+
+### 3. Container Volume Mounts Are Powerful
+
+With volume mounts, code changes don't require rebuild:
+- Copy file to host directory
+- Immediately available in container
+- Just restart container to reload Python modules
+
+### 4. Import Errors Can Be Subtle
+
+`ModuleNotFoundError: No module named 'app.models'` could mean:
+1. Directory doesn't exist (our case)
+2. Missing `__init__.py`
+3. Wrong PYTHONPATH
+4. Circular imports
+5. Package naming conflict
+
+Always verify directory structure and import paths.
+
+---
+
+End of Devlog

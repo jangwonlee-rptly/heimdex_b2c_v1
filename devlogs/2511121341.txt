@@ -1,0 +1,178 @@
+# Devlog: Authentication and Database Schema Fixes
+Date: 2025-11-12 13:41
+Session Type: Bug Fix
+
+## Session Overview
+Fixed multiple authentication and database schema issues that prevented users from logging in and uploading videos. The session involved:
+- Fixing frontend token storage for authentication
+- Adding missing supabase_user_id column to User model
+- Creating complete database schema
+- Resolving enum type mismatches between Python models and PostgreSQL
+
+### Files Modified
+- web/src/components/auth/LoginForm.tsx
+- web/src/components/auth/RegisterForm.tsx
+- web/src/store/auth.ts
+- api/app/models/user.py
+- db/migrations/versions/20251110_2100_001_initial_schema.py
+- db/create_schema.sql (created)
+
+## Issues Encountered
+
+### Issue 1: 403 Forbidden After Successful Login
+**Error**: After successful login (200 OK), subsequent API requests returned 403 Forbidden
+
+**Context**:
+- User could log in successfully
+- Dashboard and video upload requests immediately failed with 403
+- Tokens were returned from backend but not being sent in subsequent requests
+
+**Root Cause**: LoginForm and RegisterForm were receiving auth tokens from backend but never storing them in localStorage. The API client's request interceptor expected tokens in localStorage to add Authorization headers.
+
+**Solution**:
+1. Updated LoginForm.tsx to store tokens after successful login:
+   ```typescript
+   localStorage.setItem('access_token', response.access_token);
+   localStorage.setItem('refresh_token', response.refresh_token);
+   ```
+2. Updated RegisterForm.tsx with same token storage logic
+3. Updated auth store logout function to clear tokens from localStorage
+
+**Location**:
+- web/src/components/auth/LoginForm.tsx:27-29
+- web/src/components/auth/RegisterForm.tsx:34-36
+- web/src/store/auth.ts:42-46
+
+### Issue 2: Missing supabase_user_id Column
+**Error**:
+```
+AttributeError: type object 'User' has no attribute 'supabase_user_id'
+```
+
+**Context**: When trying to upload a video after fixing authentication, user sync failed because the User model was missing the Supabase integration column.
+
+**Root Cause**: The User model didn't have a `supabase_user_id` column, but the user_sync.py code expected it for linking Supabase Auth users to local database users.
+
+**Solution**:
+1. Added `supabase_user_id` column to User model:
+   ```python
+   supabase_user_id = Column(PGUUID(as_uuid=True), nullable=True, unique=True, index=True)
+   ```
+2. Updated initial migration to include the column
+3. Created complete database schema from scratch
+
+**Location**:
+- api/app/models/user.py:25
+- db/migrations/versions/20251110_2100_001_initial_schema.py:25
+
+### Issue 3: No Database Tables Existed
+**Error**: Relation "users" does not exist
+
+**Context**: Despite migrations existing, database only had schema_version table
+
+**Root Cause**: Migrations were never run. Alembic configuration existed but wasn't being executed on container startup.
+
+**Solution**: Created SQL schema file and executed it directly via psql:
+```bash
+docker compose exec -T db psql -U heimdex -d heimdex < db/create_schema.sql
+```
+
+**Location**: db/create_schema.sql
+
+### Issue 4: Enum Type Value Mismatch
+**Error**:
+```
+LookupError: 'free' is not among the defined enum values. Enum name: usertier. Possible values: FREE, PRO, ENTERPRISE
+```
+
+**Context**: After creating schema, reading from users table failed with enum mismatch
+
+**Root Cause**: Initially created PostgreSQL enums with uppercase values ('FREE', 'PRO', 'ENTERPRISE') but Python enum definitions use lowercase VALUES:
+```python
+class UserTier(str, enum.Enum):
+    FREE = "free"  # Member name is FREE, but value is "free"
+    PRO = "pro"
+    ENTERPRISE = "enterprise"
+```
+
+SQLAlchemy stores enum VALUES in the database, not member NAMES.
+
+**Solution Attempts**:
+1. ❌ First tried uppercase enum values in database - caused mismatch
+2. ✅ Recreated enums with lowercase values matching Python enum values
+3. Updated all enum types: user_tier, video_state, job_stage, job_state
+4. Fixed job_state enum to include all values from model (pending, running, completed, failed, cancelled)
+
+**Final Schema**:
+```sql
+CREATE TYPE user_tier AS ENUM ('free', 'pro', 'enterprise');
+CREATE TYPE video_state AS ENUM ('uploading', 'validating', 'processing', 'indexed', 'failed', 'deleted');
+CREATE TYPE job_stage AS ENUM ('upload_validate', 'audio_extract', 'asr_fast', 'scene_detect', 'align_merge', 'embed_text', 'vision_sample_frames', 'vision_embed_frames', 'vision_affect_tags', 'faces_enroll_match', 'sidecar_build', 'commit');
+CREATE TYPE job_state AS ENUM ('pending', 'running', 'completed', 'failed', 'cancelled');
+```
+
+**Location**: db/create_schema.sql:5-8
+
+## Final Working Solution
+
+### Database Schema
+Complete schema created with:
+- All tables: users, videos, scenes, jobs, face_profiles, face_detections, audit_events, refresh_tokens, email_verification_tokens, video_metadata
+- Proper foreign key relationships
+- pgvector columns for embeddings
+- Correct enum types with lowercase values
+- Indexes for performance
+
+### Authentication Flow
+1. User logs in → Backend returns tokens
+2. Frontend stores tokens in localStorage
+3. API client interceptor adds Authorization header from localStorage
+4. Backend validates JWT and syncs user to local DB via supabase_user_id
+5. User can access protected endpoints
+
+### Commands Used
+```bash
+# Drop and recreate schema
+docker compose exec db psql -U heimdex -d heimdex -c "DROP TABLE IF EXISTS ... CASCADE"
+
+# Create schema
+docker compose exec -T db psql -U heimdex -d heimdex < db/create_schema.sql
+
+# Verify table structure
+docker compose exec db psql -U heimdex -d heimdex -c "\d users"
+
+# Check enum values
+docker compose exec db psql -U heimdex -d heimdex -c "SELECT enumlabel FROM pg_enum WHERE enumtypid = 'user_tier'::regtype"
+
+# Restart services
+docker compose restart api web
+```
+
+## Lessons Learned
+
+1. **Enum Mismatches**: When using SQLAlchemy Enum types, the database enum values must match the Python enum VALUES (not NAMES). For `FREE = "free"`, the database needs `'free'` not `'FREE'`.
+
+2. **Token Storage**: Frontend must persist auth tokens in localStorage for the API client's request interceptor to work. Don't rely on state management alone.
+
+3. **Migration Execution**: Alembic migrations need explicit execution. Consider adding migration runner to container startup scripts.
+
+4. **Database Schema Alignment**: When reconstructing schemas from code, carefully check all enum values in all models to ensure database matches exactly.
+
+5. **Debugging Process**: When SQLAlchemy enum errors occur, check both the Python enum definition AND the PostgreSQL enum type values with:
+   ```sql
+   SELECT enumlabel FROM pg_enum WHERE enumtypid = 'type_name'::regtype;
+   ```
+
+## Next Steps
+
+1. Test complete video upload flow
+2. Add Alembic migration execution to container startup
+3. Consider using SQLAlchemy's `create_all()` for dev environments
+4. Add database migration documentation to README
+
+## Status
+✅ Authentication working
+✅ Database schema created
+✅ All enum types aligned
+✅ User sync via Supabase working
+⏳ Video upload ready to test

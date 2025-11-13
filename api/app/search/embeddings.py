@@ -167,7 +167,13 @@ def _generate_text_embedding_uncached(text: str) -> Optional[np.ndarray]:
         result = response.json()
         embedding = np.array(result["embedding"], dtype=np.float32)
 
-        logger.info(f"[embeddings] Generated {result['dimension']}-dim embedding in {result['latency_ms']:.0f}ms")
+        # Normalize embedding to unit length for cosine distance
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+            logger.info(f"[embeddings] Generated {result['dimension']}-dim embedding in {result['latency_ms']:.0f}ms (normalized, L2 norm={norm:.2f})")
+        else:
+            logger.warning(f"[embeddings] Generated zero-norm embedding - skipping normalization")
 
         return embedding
 

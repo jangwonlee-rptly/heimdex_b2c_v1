@@ -45,6 +45,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+# BUT: Don't ignore TypeScript source lib directories
+!web/src/lib/
 lib64/
 parts/
 sdist/
@@ -126,7 +128,9 @@ coverage/
 # MACHINE LEARNING MODELS & ARTIFACTS
 # ==========================================
 # Model weights (large files - download separately)
-models/
+# Note: Excludes ML model weight directories but NOT api/app/models (ORM definitions)
+worker/models/
+model-service/models/
 *.pth
 *.pt
 *.bin

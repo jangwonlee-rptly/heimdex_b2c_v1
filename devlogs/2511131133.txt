@@ -1,0 +1,309 @@
+================================================================================
+DEVLOG: Frontend Search Endpoint Fix & SQL Type Casting
+================================================================================
+Date: 2025-11-13 11:33 (Local) / 02:33 UTC
+Session: Search endpoint mismatch and asyncpg NULL parameter type issues
+
+================================================================================
+SESSION OVERVIEW
+================================================================================
+
+User reported that searching for "8927" (the filename of a newly uploaded video)
+returned "No results found (1 total)" in the UI, despite the video being
+successfully indexed.
+
+Root causes identified:
+1. Frontend was calling `/search/semantic` (pure vector similarity search)
+   instead of the new `/search` endpoint (hybrid search with metadata support)
+2. SQL query had parameter type ambiguity issues with NULL values in asyncpg
+
+Files modified:
+- web/src/lib/api.ts - Updated search() to use hybrid endpoint
+- api/app/search/routes.py - Fixed NULL parameter type casting in SQL
+
+================================================================================
+CHANGES MADE
+================================================================================
+
+## 1. Frontend API Client (web/src/lib/api.ts)
+
+Changed the default search() method from semantic-only to hybrid search:
+
+Before:
+```typescript
+async search(query: SearchQuery): Promise<SearchResponse> {
+  // Use semantic search endpoint for multimodal SigLIP embeddings
+  const response = await this.client.get<SearchResponse>('/search/semantic', { params: query });
+  return response.data;
+}
+```
+
+After:
+```typescript
+async search(query: SearchQuery): Promise<SearchResponse> {
+  // Use hybrid search endpoint (metadata + semantic + keyword)
+  const response = await this.client.get<SearchResponse>('/search', { params: query });
+  return response.data;
+}
+
+async keywordSearch(query: SearchQuery): Promise<SearchResponse> {
+  // Fallback to keyword search if needed (kept for backwards compatibility)
+  const response = await this.client.get<SearchResponse>('/search', { params: query });
+  return response.data;
+}
+
+async semanticSearch(query: SearchQuery): Promise<SearchResponse> {
+  // Legacy semantic-only search endpoint (pure vector similarity, no metadata)
+  const response = await this.client.get<SearchResponse>('/search/semantic', { params: query });
+  return response.data;
+}
+```
+
+Why: The `/search/semantic` endpoint only does vector similarity matching. When
+searching for "8927" (a filename), it tries to find semantically similar scenes,
+which won't match a numeric filename. The `/search` endpoint includes metadata
+matching (filename, title, description) which is needed for this use case.
+
+## 2. SQL Query Type Casting (api/app/search/routes.py)
+
+Fixed parameter type ambiguity for optional duration filters:
+
+First attempt (FAILED):
+```sql
+AND (:min_duration::float IS NULL OR v.duration_s >= :min_duration::float)
+```
+
+Error:
+```
+asyncpg.exceptions.PostgresSyntaxError: syntax error at or near ":"
+```
+
+Cause: SQLAlchemy uses `:param` syntax for named parameters. When it sees
+`:min_duration::float`, it tries to parse `::float` as part of the parameter
+name, causing a syntax error. The `::` operator is PostgreSQL-specific syntax
+that conflicts with SQLAlchemy's parameter parsing.
+
+Final solution (WORKS):
+```sql
+AND (CAST(:min_duration AS FLOAT) IS NULL OR v.duration_s >= CAST(:min_duration AS FLOAT))
+AND (CAST(:max_duration AS FLOAT) IS NULL OR v.duration_s <= CAST(:max_duration AS FLOAT))
+```
+
+This change was applied to all 3 occurrences in the comprehensive search query:
+- metadata_matches CTE (2 occurrences)
+- scene_scores CTE (2 occurrences)
+- fallback query (2 occurrences)
+
+Why: Using standard SQL CAST() syntax instead of PostgreSQL's `::` operator
+allows SQLAlchemy to properly parse the parameters while still providing type
+hints to PostgreSQL when values are NULL.
+
+================================================================================
+ERRORS ENCOUNTERED
+================================================================================
+
+## Error 1: Ambiguous Parameter Type (Initial Issue)
+
+Full error:
+```
+sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError:
+<class 'asyncpg.exceptions.AmbiguousParameterError'>:
+could not determine data type of parameter $4
+```
+
+Context: When calling `/search` with no duration filters, `min_duration` and
+`max_duration` are passed as `None`. Asyncpg couldn't infer the type.
+
+SQL snippet causing error:
+```sql
+AND (:min_duration IS NULL OR v.duration_s >= :min_duration)
+AND (:max_duration IS NULL OR v.duration_s <= :max_duration)
+```
+
+Parameters: `{'min_duration': None, 'max_duration': None, ...}`
+
+Why it failed: PostgreSQL's asyncpg driver needs explicit type information for
+NULL parameters. Without a type hint, it doesn't know whether None should be
+treated as NULL::integer, NULL::float, NULL::text, etc.
+
+## Error 2: PostgreSQL Cast Syntax Conflict
+
+Full error:
+```
+sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError:
+<class 'asyncpg.exceptions.PostgresSyntaxError'>:
+syntax error at or near ":"
+```
+
+Context: After attempting to fix Error 1 by adding `::float` type casts.
+
+SQL snippet causing error:
+```sql
+AND (:min_duration::float IS NULL OR v.duration_s >= :min_duration::float)
+```
+
+Why it failed: SQLAlchemy parameter syntax (`:param_name`) conflicts with
+PostgreSQL's cast operator syntax (`value::type`). When SQLAlchemy's text()
+function sees `:min_duration::float`, it interprets the first `:` as the start
+of a parameter but gets confused by the second `:` in `::float`.
+
+================================================================================
+SOLUTION ATTEMPTS
+================================================================================
+
+## Attempt 1: Add ::float type cast (FAILED)
+
+Approach:
+```sql
+AND (:min_duration::float IS NULL OR v.duration_s >= :min_duration::float)
+```
+
+Reasoning: Use PostgreSQL's native type cast syntax to provide type hints.
+
+Result: Syntax error - SQLAlchemy couldn't parse the double colon in parameter context.
+
+## Attempt 2: Use CAST() function (SUCCESS)
+
+Approach:
+```sql
+AND (CAST(:min_duration AS FLOAT) IS NULL OR v.duration_s >= CAST(:min_duration AS FLOAT))
+```
+
+Reasoning: Use standard SQL CAST() function which SQLAlchemy can properly parse
+and still provides type information to PostgreSQL.
+
+Result: Works perfectly. PostgreSQL receives typed NULL values, and SQLAlchemy
+can correctly parse the parameter references.
+
+================================================================================
+FINAL SOLUTION
+================================================================================
+
+## Frontend Change
+
+Updated `web/src/lib/api.ts` to use hybrid search by default:
+- Main search() method now calls `/search` (hybrid: metadata + semantic + keyword)
+- Added semanticSearch() method for legacy `/search/semantic` endpoint
+- Both search() and keywordSearch() now use the same hybrid endpoint
+
+Benefits:
+- Filename searches work (e.g., "8927" matches storage_key)
+- Title/description searches work
+- Visual semantic search still works
+- Korean transcript + English query works (via embeddings)
+- Silent videos searchable by metadata
+
+## Backend Change
+
+Fixed SQL parameter type casting in `api/app/search/routes.py`:
+- Changed from `:param::type` syntax to `CAST(:param AS TYPE)` syntax
+- Applied to all min_duration and max_duration comparisons
+- Maintains NULL-safe conditional logic
+
+Benefits:
+- No type ambiguity errors when passing None values
+- Proper PostgreSQL type inference
+- SQLAlchemy can correctly parse parameters
+- Standard SQL syntax (portable)
+
+## Testing
+
+After restart:
+```bash
+docker compose restart api
+```
+
+API logs show successful startup:
+```
+INFO:     Application startup complete.
+INFO:     127.0.0.1:45404 - "GET /health HTTP/1.1" 200 OK
+```
+
+Search should now work for:
+- Filename queries: "8927" matches storage_key containing "IMG_8927.MOV"
+- Title queries: partial match in video_metadata.title
+- Description queries: match in video_metadata.description
+- Visual queries: semantic similarity via image_vec
+- Transcript queries: Korean text with English queries (via embeddings)
+
+================================================================================
+LESSONS LEARNED
+================================================================================
+
+1. **Endpoint Consistency Matters**
+   When implementing new functionality (hybrid search), ensure all client code
+   is updated to use the new endpoints. Frontend was still using old semantic-
+   only endpoint which didn't support metadata matching.
+
+2. **asyncpg Requires Type Hints for NULL**
+   Unlike psycopg2, asyncpg needs explicit type information for NULL/None
+   parameters. Always provide type casts when using NULL in conditional logic.
+
+3. **SQLAlchemy Parameter Syntax vs PostgreSQL Syntax**
+   Be careful mixing SQLAlchemy's `:param` syntax with PostgreSQL-specific
+   operators like `::type`. Use standard SQL functions (CAST, COALESCE) that
+   both SQLAlchemy and PostgreSQL understand.
+
+4. **PostgreSQL :: Operator in Raw SQL**
+   When using `text()` for raw SQL in SQLAlchemy, avoid PostgreSQL's `::` cast
+   operator near parameter placeholders. Use `CAST(:param AS TYPE)` instead.
+
+5. **Search Architecture**
+   Pure semantic/vector search doesn't work well for:
+   - Filename/ID searches (numeric or alphanumeric identifiers)
+   - Exact title matches
+   - Metadata filtering
+
+   Always combine multiple search signals (metadata + semantic + keyword) for
+   better user experience.
+
+6. **Testing Search Paths**
+   Test search with different query types:
+   - Filenames/IDs: "8927", "IMG_8778"
+   - Visual concepts: "person", "outdoor", "beach"
+   - Non-Latin text: Korean, Japanese, Chinese
+   - Silent videos: only metadata and visual search work
+
+7. **SQL Error Patterns**
+   - "could not determine data type": Missing type cast
+   - "syntax error at or near ':'": Parameter syntax conflict
+   - "column ambiguity": Missing table alias or DISTINCT
+
+================================================================================
+RELATED ISSUES
+================================================================================
+
+Previous devlog: devlogs/2511131652.txt
+- Implemented comprehensive hybrid search at /search endpoint
+- Added metadata scoring (30% weight)
+- Combined with semantic (50%) and keyword (20%) scoring
+
+Context:
+The hybrid search was implemented but frontend wasn't updated to use it,
+causing user confusion when filename searches failed.
+
+================================================================================
+NEXT STEPS (Optional)
+================================================================================
+
+1. Consider adding search query suggestions based on:
+   - Video filenames (auto-complete from storage_key)
+   - Existing tags from video_metadata
+   - Common visual concepts from previous searches
+
+2. Add search analytics:
+   - Track query patterns (filename vs concept vs keyword)
+   - Monitor which scoring signals produce results
+   - Identify failed searches for improvement
+
+3. Test edge cases:
+   - Very long filenames
+   - Special characters in queries
+   - Multiple filters combined (duration + person + query)
+
+4. UI improvements:
+   - Show which match type produced results (metadata vs semantic vs keyword)
+   - Display confidence scores for search results
+   - Add search filters in UI for duration, person, etc.
+
+================================================================================

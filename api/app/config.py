@@ -48,11 +48,11 @@ class Settings(BaseSettings):
     storage_bucket_thumbnails: str = "thumbnails"
     storage_bucket_tmp: str = "tmp"
 
-    # Supabase Authentication
-    supabase_url: str = Field(..., description="Supabase project URL")
-    supabase_key: str = Field(..., description="Supabase anon/public key")
+    # Supabase Authentication (optional for local dev, required for production)
+    supabase_url: Optional[str] = Field(None, description="Supabase project URL")
+    supabase_key: Optional[str] = Field(None, description="Supabase anon/public key")
     supabase_service_role_key: Optional[str] = Field(None, description="Supabase service role key (for admin operations)")
-    supabase_jwt_secret: str = Field(..., description="Supabase JWT secret for token verification")
+    supabase_jwt_secret: Optional[str] = Field(None, description="Supabase JWT secret for token verification")
 
     # Legacy JWT settings (kept for backwards compatibility if needed)
     jwt_secret_key: Optional[str] = Field(None, min_length=32, description="Legacy JWT secret key (min 32 chars)")

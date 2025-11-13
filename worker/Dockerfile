@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     libpq-dev \
+    zlib1g-dev \
     ffmpeg \
     libsm6 \
     libxext6 \
@@ -35,9 +36,11 @@ RUN pip install --upgrade pip && \
 # Copy application code
 COPY worker/ .
 
-# Create directories for temporary files
+# Create directories for temporary files and models cache
 RUN mkdir -p /tmp/heimdex && \
-    chmod 777 /tmp/heimdex
+    chmod 777 /tmp/heimdex && \
+    mkdir -p /app/models/.cache && \
+    chmod -R 777 /app/models
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && \

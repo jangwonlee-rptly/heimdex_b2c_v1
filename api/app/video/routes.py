@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.middleware import AuthUser, get_current_user
@@ -14,6 +15,7 @@ from app.config import settings
 from app.db import get_db
 from app.logging_config import logger
 from app.models.video import Video, VideoState
+from app.models.video_metadata import VideoMetadata
 from app.models.job import Job, JobStage, JobState
 from app.models.scene import Scene
 from app.storage import StorageClient
@@ -115,12 +117,19 @@ async def init_video_upload(
         storage_key=storage_key,
         mime_type=request.mime_type,
         size_bytes=request.size_bytes,
-        title=request.title or request.filename,
-        description=request.description,
-        state='uploading',
+        state=VideoState.UPLOADING,
     )
-
     db.add(video)
+
+    # Create video metadata if title or description provided
+    if request.title or request.description:
+        metadata = VideoMetadata(
+            video_id=video_id,
+            title=request.title or request.filename,
+            description=request.description,
+        )
+        db.add(metadata)
+
     await db.commit()
     await db.refresh(video)
 
@@ -264,9 +273,10 @@ async def list_videos(
     total_result = await db.execute(count_stmt)
     total = total_result.scalar() or 0
 
-    # Get videos
+    # Get videos with metadata
     stmt = (
         select(Video)
+        .options(selectinload(Video.video_metadata))
         .where(Video.user_id == UUID(user.user_id))
         .order_by(Video.created_at.desc())
         .limit(limit)
@@ -325,8 +335,8 @@ async def list_videos(
             VideoResponse(
                 video_id=str(v.video_id),
                 user_id=str(v.user_id),
-                title=v.title,
-                description=v.description,
+                title=v.video_metadata.title if v.video_metadata else None,
+                description=v.video_metadata.description if v.video_metadata else None,
                 mime_type=v.mime_type,
                 size_bytes=v.size_bytes,
                 duration_s=float(v.duration_s) if v.duration_s else None,
@@ -349,9 +359,13 @@ async def get_video(
     db: AsyncSession = Depends(get_db),
 ) -> VideoResponse:
     """Get details for a specific video."""
-    stmt = select(Video).where(
-        Video.video_id == UUID(video_id),
-        Video.user_id == UUID(user.user_id),
+    stmt = (
+        select(Video)
+        .options(selectinload(Video.video_metadata))
+        .where(
+            Video.video_id == UUID(video_id),
+            Video.user_id == UUID(user.user_id),
+        )
     )
     result = await db.execute(stmt)
     video = result.scalar_one_or_none()
@@ -389,8 +403,8 @@ async def get_video(
     return VideoResponse(
         video_id=str(video.video_id),
         user_id=str(video.user_id),
-        title=video.title,
-        description=video.description,
+        title=video.video_metadata.title if video.video_metadata else None,
+        description=video.video_metadata.description if video.video_metadata else None,
         mime_type=video.mime_type,
         size_bytes=video.size_bytes,
         duration_s=float(video.duration_s) if video.duration_s else None,

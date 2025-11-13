@@ -1,0 +1,333 @@
+# Devlog: Fixed Worker Video Processor to Use VideoMetadata Relationship
+Date: 2025-11-12 14:24
+Session Type: Bug Fix
+Status: ✅ RESOLVED
+
+## Session Overview
+
+Updated worker's `video_processor.py` to use the VideoMetadata relationship when accessing video title, matching the changes made to API routes. Also added eager loading for video_metadata when querying videos in the worker.
+
+### Files Modified
+- worker/tasks/video_processor.py
+
+## Issue Encountered
+
+### Error Message
+```
+AttributeError: 'Video' object has no attribute 'title'
+```
+
+### Context
+- User uploaded video successfully
+- Worker started processing: ASR transcription ✓, scene detection ✓
+- Worker failed when trying to generate scene embeddings
+- Code tried to access `video.title` for fallback text embedding
+- Video model no longer has `title` attribute (moved to VideoMetadata table)
+- Processing failed and retried multiple times before exhausting retries
+
+### Stack Trace Location
+```
+File "/app/tasks/video_processor.py", line 269, in process_video
+    text_for_embedding = scene_transcript if scene_transcript else (video.title or "untitled video")
+                                                                    ^^^^^^^^^^^
+AttributeError: 'Video' object has no attribute 'title'
+```
+
+### Processing Progress Before Error
+✅ Video download from MinIO
+✅ ffprobe validation
+✅ Audio extraction
+✅ Whisper ASR transcription
+✅ Scene detection with PySceneDetect
+❌ Scene embedding generation (failed at line 269)
+
+## Root Cause Analysis
+
+### The Problem
+
+When we fixed the Video model schema mismatch (devlog 2511121357.txt and 2511121407.txt), we:
+1. ✅ Removed `title` and `description` from Video model
+2. ✅ Created VideoMetadata model
+3. ✅ Updated API route handlers to use `video.video_metadata.title`
+4. ❌ **Did NOT update worker code**
+
+The worker code still had the old pattern:
+```python
+video.title  # ❌ Attribute doesn't exist anymore
+```
+
+### Why Worker Wasn't Updated
+
+1. **Models copied after route fixes:** When we copied models to worker (devlog 2511121415.txt), we copied the updated models but didn't update the worker's usage of those models.
+
+2. **Different codebase locations:** API routes are in `api/app/video/routes.py`, worker logic is in `worker/tasks/video_processor.py`. We updated API but forgot worker.
+
+3. **Not tested until now:** This was the first time a video got far enough in processing to hit this line of code. Previous videos failed earlier due to other issues.
+
+### The Code Location
+
+**File:** `worker/tasks/video_processor.py`
+
+**Purpose of this code (lines 266-272):**
+When creating scene records, generate a text embedding for each scene. Use the scene transcript if available, otherwise fall back to video title so scenes are still searchable even without transcripts.
+
+```python
+# Generate text embedding via model service
+# If no transcript, use video title as fallback so scene is still searchable
+text_embedding = None
+text_for_embedding = scene_transcript if scene_transcript else (video.title or "untitled video")  # ❌ OLD CODE
+if text_for_embedding:
+    text_embedding = client.generate_text_embedding(text_for_embedding, model="siglip")
+```
+
+## Solution
+
+### Changes Made
+
+**1. Added VideoMetadata import and selectinload (lines 180-187)**
+
+BEFORE:
+```python
+try:
+    # Get video record
+    from app.models.video import Video
+    from app.models.scene import Scene
+    from app.models.job import Job
+
+    video = session.query(Video).filter(Video.video_id == video_id).first()
+    if not video:
+        raise ValueError(f"Video {video_id} not found")
+```
+
+AFTER:
+```python
+try:
+    # Get video record
+    from app.models.video import Video
+    from app.models.video_metadata import VideoMetadata
+    from app.models.scene import Scene
+    from app.models.job import Job
+    from sqlalchemy.orm import selectinload
+
+    video = session.query(Video).options(selectinload(Video.video_metadata)).filter(Video.video_id == video_id).first()
+    if not video:
+        raise ValueError(f"Video {video_id} not found")
+```
+
+**2. Updated title access to use relationship (lines 268-272)**
+
+BEFORE:
+```python
+# Generate text embedding via model service
+# If no transcript, use video title as fallback so scene is still searchable
+text_embedding = None
+text_for_embedding = scene_transcript if scene_transcript else (video.title or "untitled video")
+```
+
+AFTER:
+```python
+# Generate text embedding via model service
+# If no transcript, use video title as fallback so scene is still searchable
+text_embedding = None
+video_title = video.video_metadata.title if video.video_metadata else None
+text_for_embedding = scene_transcript if scene_transcript else (video_title or "untitled video")
+```
+
+### Why This Pattern
+
+**Eager Loading:**
+```python
+.options(selectinload(Video.video_metadata))
+```
+- Loads video_metadata in same query as video
+- Prevents N+1 query problem
+- Ensures metadata is available without additional DB hit
+
+**Null Safety:**
+```python
+video_title = video.video_metadata.title if video.video_metadata else None
+```
+- Checks if video_metadata exists (it's optional)
+- Returns None if no metadata
+- Falls back to "untitled video" in final expression
+- Handles videos uploaded without title/description
+
+### Verification
+
+1. Verified fix is in worker container:
+   ```bash
+   docker compose exec worker grep -A 3 "video.video_metadata.title" /app/tasks/video_processor.py
+   ```
+   Result: Shows updated code ✓
+
+2. Restarted worker:
+   ```bash
+   docker compose restart worker
+   ```
+   Result: Worker ready for action ✓
+
+3. Ready for new video upload to test end-to-end
+
+## Key Patterns Learned
+
+### 1. Consistency Across Codebases
+
+When making schema changes that affect multiple services:
+1. ✓ Update ORM models
+2. ✓ Update API route handlers
+3. ✓ **Update worker task handlers** ← We forgot this step initially
+4. ✓ Update any other code that uses the models
+
+**Checklist for model changes:**
+- [ ] Update model definition
+- [ ] Update API create operations
+- [ ] Update API read operations
+- [ ] Update API update operations
+- [ ] Update worker processing code
+- [ ] Update any background jobs
+- [ ] Update tests
+- [ ] Update migrations/schema
+
+### 2. Eager Loading in Worker
+
+Workers should eager load relationships when:
+- Processing involves accessing related data
+- Avoiding N+1 queries matters for performance
+- Relationship might be None (need to handle gracefully)
+
+```python
+# Good pattern for worker queries
+video = session.query(Video).options(
+    selectinload(Video.video_metadata),
+    selectinload(Video.scenes)
+).filter(Video.video_id == video_id).first()
+```
+
+### 3. Fallback Values for Optional Data
+
+When using optional metadata:
+
+```python
+# ❌ Unsafe - will error if video_metadata is None
+text = video.video_metadata.title or "fallback"
+
+# ✅ Safe - handles None gracefully
+text = (video.video_metadata.title if video.video_metadata else None) or "fallback"
+
+# ✅ Alternative with getattr
+text = getattr(video.video_metadata, 'title', None) or "fallback"
+```
+
+### 4. Testing Worker Code
+
+Worker errors are harder to catch because:
+- Don't fail at startup (only when processing)
+- May not happen until specific processing stage
+- Require actual test data to trigger
+
+**Recommendation:** Add worker smoke tests that import all models and verify basic queries work.
+
+## Related Devlogs
+
+**Schema refactoring progression:**
+1. devlogs/2511121357.txt - Created VideoMetadata model, removed fields from Video
+2. devlogs/2511121407.txt - Updated **API routes** for VideoMetadata
+3. devlogs/2511121424.txt - Updated **worker** for VideoMetadata (this devlog)
+
+**Other worker fixes:**
+- devlogs/2511121415.txt - Fixed worker missing models directory
+
+## Status
+
+**Issue**: ✅ RESOLVED
+**Risk Level**: 🟢 LOW - Same pattern as API routes fix
+**Confidence**: 🟢 HIGH - Code verified in container
+
+**Testing Status**:
+- ✅ Fix verified in worker container
+- ✅ Worker restarted successfully
+- ⏳ End-to-end video processing (requires new upload)
+
+**Previous Video**:
+- Video ID: 9a369337-501b-4384-a0f8-bff0043bdaad
+- Status: Failed - retries exhausted at 05:22:30
+- Won't be automatically reprocessed
+
+## Next Steps for User
+
+1. **Upload a new video** - Previous video exhausted retries before fix
+2. **Monitor worker logs** for successful processing:
+   ```bash
+   docker compose logs -f worker
+   ```
+3. **Expected to see:**
+   - ✓ ASR transcription
+   - ✓ Scene detection
+   - ✓ Embedding generation (should work now)
+   - ✓ Thumbnail generation
+   - ✓ Video marked as "indexed"
+
+## Lessons Learned
+
+### 1. Schema Changes Affect Multiple Services
+
+In microservice/multi-container architectures, model changes propagate to:
+- API service (HTTP handlers)
+- Worker service (background jobs)
+- Any other services that query the database
+
+Must update ALL services that use the changed models.
+
+### 2. Volume Mounts Speed Up Development
+
+Because worker uses volume mount:
+```yaml
+worker:
+  volumes:
+    - ./worker:/app
+```
+
+Code changes apply immediately without rebuild:
+1. Edit file on host
+2. Restart container
+3. New code loads
+
+This made fixing the bug very fast (no image rebuild needed).
+
+### 3. Retries Have Limits
+
+Dramatiq default retry behavior:
+- Retries failed tasks automatically
+- Exponential backoff (11s, 21s, 28s, ...)
+- After ~20 retries: Gives up permanently
+
+**Important:** If you fix a bug after retries exhausted, those messages won't be retried. Need to resubmit the work (upload new video, trigger new job, etc.).
+
+### 4. Worker Progress Shows What Works
+
+The error log showed:
+- ✅ ASR worked
+- ✅ Scene detection worked
+- ❌ Embedding generation failed
+
+This tells us:
+- Model service integration works
+- Video processing pipeline is mostly correct
+- Just needed to fix the metadata access
+
+## Remaining Work
+
+The video processing pipeline should now work end-to-end! All identified issues have been fixed:
+
+1. ✅ Enum values and type names
+2. ✅ VideoMetadata schema in API
+3. ✅ VideoMetadata schema in worker
+4. ✅ Worker has models directory
+5. ✅ Scene thumbnail_key column exists
+6. ✅ Worker uses VideoMetadata relationship
+
+**Ready to test full pipeline!**
+
+---
+
+End of Devlog

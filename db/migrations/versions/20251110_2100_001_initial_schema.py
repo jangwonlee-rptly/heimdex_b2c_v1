@@ -1,6 +1,6 @@
 """Initial schema with users, videos, scenes, jobs, face_profiles, and audit tables
 
-Revision ID: 001
+Revision ID: 20251110_2100_001
 Revises:
 Create Date: 2025-11-10 21:00:00.000000
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = '001'
+revision: str = '20251110_2100_001'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -22,6 +22,7 @@ def upgrade() -> None:
     op.create_table(
         'users',
         sa.Column('user_id', postgresql.UUID(as_uuid=True), primary_key=True, server_default=sa.text('uuid_generate_v4()')),
+        sa.Column('supabase_user_id', postgresql.UUID(as_uuid=True), nullable=True, unique=True),  # Supabase Auth user ID
         sa.Column('email', sa.String(255), nullable=False, unique=True),
         sa.Column('email_verified', sa.Boolean(), nullable=False, server_default='false'),
         sa.Column('password_hash', sa.String(255), nullable=True),  # Nullable for magic link only users
@@ -33,6 +34,7 @@ def upgrade() -> None:
         sa.Column('last_login_at', sa.TIMESTAMP(timezone=True), nullable=True),
     )
     op.create_index('idx_users_email', 'users', ['email'])
+    op.create_index('idx_users_supabase_user_id', 'users', ['supabase_user_id'])
 
     # Videos table
     op.create_table(

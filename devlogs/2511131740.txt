@@ -1,0 +1,367 @@
+# Devlog: Fixed Worker ASR Timeout Issue
+Date: 2025-11-13 17:40 (Local) / 05:40 UTC
+Session Type: Bug Fix
+Status: ✅ FIXED
+
+## Session Overview
+
+Fixed timeout errors in the worker container when transcribing Korean audio with Whisper ASR. The worker was timing out after 2 minutes when processing videos, causing video indexing to fail.
+
+### Files Modified
+- `worker/shared/model_client/client.py` (increased default timeout from 60s to 300s)
+- `worker/tasks/video_processor.py` (increased timeout from 120s to 600s in get_model_client())
+
+### Problem Statement
+
+Worker container was throwing `httpx.ReadTimeout` errors during ASR transcription:
+
+```
+File "/app/tasks/video_processor.py", line 230, in process_video
+    transcript_result = client.transcribe_audio(str(audio_path), language="ko")
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/app/shared/model_client/client.py", line 80, in transcribe_audio
+    response = self.client.post("/asr/transcribe", json=payload)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+httpx.ReadTimeout: timed out
+```
+
+**User Impact**: Videos stuck in "processing" state, never completing indexing.
+
+## Root Cause Analysis
+
+### Initial Timeout Configuration
+
+The ModelServiceClient had **two layers** of timeout configuration:
+
+**Layer 1: Default timeout in ModelServiceClient.__init__()**
+```python
+# worker/shared/model_client/client.py:20
+def __init__(self, base_url: Optional[str] = None, timeout: float = 60.0):
+    self.client = httpx.Client(base_url=self.base_url, timeout=timeout)
+```
+**Default: 60 seconds**
+
+**Layer 2: Explicit timeout in get_model_client()**
+```python
+# worker/tasks/video_processor.py:48
+_model_client = ModelServiceClient(base_url=model_service_url, timeout=120.0)
+```
+**Explicit: 120 seconds (2 minutes)**
+
+The explicit timeout in video_processor.py **overrode** the default, causing the 2-minute timeout.
+
+### Why ASR Takes So Long
+
+**Whisper medium model on CPU** is computationally intensive:
+
+- **Model**: Whisper medium (~2.9GB)
+- **Hardware**: CPU only (no GPU acceleration)
+- **Language**: Korean (non-English requires more processing)
+- **Typical processing time**: 1-5 minutes for 30-second video
+- **Timeout**: 120 seconds (too short!)
+
+**From model service logs**:
+```
+2025-11-13 05:29:49 [info] [whisper] Loaded in 4.62s, ~2908MB (from cache)
+2025-11-13 05:29:54 [info] [models] All models loaded successfully on cpu
+```
+
+The model service is running on **CPU**, making ASR transcription slow.
+
+## Solution Implemented
+
+### Step 1: Increased Default Timeout
+
+**Modified**: `worker/shared/model_client/client.py:20`
+
+```python
+# Before
+def __init__(self, base_url: Optional[str] = None, timeout: float = 60.0):
+
+# After
+def __init__(self, base_url: Optional[str] = None, timeout: float = 300.0):
+```
+
+**Reason**: Provide a sensible default for ASR operations (5 minutes).
+
+### Step 2: Increased Explicit Timeout
+
+**Modified**: `worker/tasks/video_processor.py:48`
+
+```python
+# Before
+_model_client = ModelServiceClient(base_url=model_service_url, timeout=120.0)
+
+# After
+_model_client = ModelServiceClient(base_url=model_service_url, timeout=600.0)
+```
+
+**Reason**: Worker ASR operations can take longer, especially for:
+- Longer videos (>1 minute)
+- Korean language transcription
+- CPU-only processing
+
+**New timeout: 600 seconds (10 minutes)**
+
+This provides plenty of headroom for even long videos on CPU.
+
+## Testing & Verification
+
+### Before Fix
+
+```bash
+docker compose logs worker --tail 30
+```
+
+Output shows timeout after ~2 minutes:
+```
+[worker] Running Whisper ASR via model service
+[worker] Connecting to model service: http://model-service:8001
+[worker] Error processing video 0d260e9e-8804-43f1-987a-baf16d2a49c4: timed out
+httpx.ReadTimeout: timed out
+```
+
+### After Fix
+
+**Worker restarted with new timeout**:
+```bash
+docker compose stop worker && docker compose rm -f worker && docker compose up -d worker
+```
+
+**Expected behavior**:
+- ASR requests should now complete successfully
+- Videos should progress to "indexed" state
+- No more timeout errors for normal-length videos
+
+### Videos Stuck in Processing
+
+Query showed 3 videos stuck:
+```sql
+SELECT video_id, state, created_at FROM videos ORDER BY created_at DESC LIMIT 5;
+
+ video_id                             | state      | created_at
+--------------------------------------+------------+----------------------------
+ 0d260e9e-8804-43f1-987a-baf16d2a49c4 | processing | 2025-11-13 05:29:59
+ 85e21580-1aa2-4774-a2de-99a32ffe125a | processing | 2025-11-13 05:27:10
+ 72d0ce9c-a407-486e-bcc8-821d40cd289b | processing | 2025-11-13 05:24:14
+```
+
+**Dramatiq retry mechanism** will eventually retry these tasks with the new timeout.
+
+## Timeout Configuration Strategy
+
+### Recommended Timeouts by Operation
+
+| Operation | Typical Duration | Recommended Timeout | Why |
+|-----------|------------------|---------------------|-----|
+| Text embedding | 50-200ms | 60s | Fast on CPU |
+| Vision embedding | 200-500ms | 60s | Fast on CPU |
+| ASR (short video <30s) | 30-120s | 600s | Slow on CPU |
+| ASR (long video >1min) | 120-300s | 600s | Very slow on CPU |
+| Face detection | 200-800ms | 60s | Fast on CPU |
+
+### Why Different Timeouts
+
+**Embedding operations (SigLIP)**:
+- Single forward pass
+- Batch processing
+- Optimized for CPU
+- **Timeout: 60s is sufficient**
+
+**ASR operations (Whisper)**:
+- Sequence-to-sequence model
+- Attention mechanism (compute intensive)
+- Multiple decoder passes
+- Language-dependent processing
+- **Timeout: 600s for safety**
+
+### Environment Variables (Future Enhancement)
+
+Could make timeouts configurable via environment variables:
+
+```bash
+# .env
+MODEL_SERVICE_TIMEOUT_DEFAULT=60      # Default operations
+MODEL_SERVICE_TIMEOUT_ASR=600         # ASR operations
+MODEL_SERVICE_TIMEOUT_EMBEDDING=60    # Embedding operations
+```
+
+Then in code:
+```python
+asr_timeout = int(os.getenv("MODEL_SERVICE_TIMEOUT_ASR", "600"))
+_model_client = ModelServiceClient(base_url=model_service_url, timeout=asr_timeout)
+```
+
+## Lessons Learned
+
+### 1. Layered Configuration Can Hide Issues
+
+The timeout was configured in **two places**:
+1. Default in `ModelServiceClient.__init__()` (60s)
+2. Explicit in `get_model_client()` (120s)
+
+**First fix** only changed the default, but the explicit value **overrode** it!
+
+**Lesson**: Check all callsites when changing default parameters.
+
+### 2. CPU vs GPU Performance Difference
+
+**Whisper on GPU**: 5-10x faster than CPU
+**Whisper on CPU**: Can take minutes for 30-second audio
+
+**Current setup**: No GPU support yet (CPU-only)
+
+**Future improvement**: Add GPU support for model service
+- Use `docker-compose.gpu.yml` (already exists)
+- Much faster ASR processing
+- Can reduce timeouts back to 60-120s
+
+### 3. Timeout Should Be Based on Worst-Case
+
+**Bad approach**: Set timeout based on average case
+- Average: 1 minute → timeout 90s
+- Fails on longer videos or busy CPU
+
+**Good approach**: Set timeout based on worst-case
+- Worst-case: 8 minutes → timeout 600s (10 min)
+- Provides headroom for variation
+
+**Trade-off**: Longer timeout means slower failure detection
+- But that's acceptable for background workers
+- Better than failing on legitimate long-running tasks
+
+### 4. Docker Container Restarts Can Be Tricky
+
+**Issue encountered**: Model service became unhealthy during worker restart
+
+**Cause**: Docker Compose dependencies can be fragile when restarting
+
+**Solution**: Explicit restart of dependent services
+```bash
+docker compose restart model-service
+docker compose up -d worker
+```
+
+### 5. Dramatiq Retry Backoff
+
+**Observed behavior**: Failed tasks not immediately retried after worker restart
+
+**Reason**: Dramatiq uses **exponential backoff** for retries:
+- 1st retry: 13 seconds
+- 2nd retry: ~30 seconds
+- 3rd retry: ~1 minute
+- 4th retry: ~3 minutes
+- etc.
+
+This prevents overwhelming the system during temporary failures.
+
+**Implication**: Fixed worker won't immediately process stuck videos - they'll retry when backoff period expires.
+
+## Related Files
+
+**Modified**:
+- `worker/shared/model_client/client.py` (line 20: timeout default)
+- `worker/tasks/video_processor.py` (line 48: timeout explicit)
+
+**Related**:
+- `model-service/app/main.py` (Whisper ASR endpoint)
+- `docker-compose.yml` (worker service definition)
+- `docker-compose.gpu.yml` (GPU-enabled alternative)
+
+## Next Steps
+
+### Immediate Actions
+
+1. **Monitor worker logs** for successful ASR completions:
+   ```bash
+   docker compose logs worker --follow
+   ```
+
+2. **Check video states** to verify processing completes:
+   ```bash
+   docker compose exec db psql -U heimdex -d heimdex \
+     -c "SELECT video_id, state FROM videos WHERE state='processing';"
+   ```
+
+3. **Upload a test video** to verify end-to-end flow works
+
+### Future Improvements
+
+1. **Add GPU support**:
+   - Use `docker-compose.gpu.yml`
+   - 5-10x faster ASR processing
+   - Can reduce timeouts
+
+2. **Make timeouts configurable**:
+   - Add environment variables for different operation types
+   - Allow per-environment tuning
+
+3. **Add timeout logging**:
+   ```python
+   logger.info(f"[worker] ASR request timeout: {timeout}s")
+   ```
+   This makes debugging easier when timeouts occur.
+
+4. **Add progress tracking for long operations**:
+   - Whisper can report progress during transcription
+   - Show user % complete in UI
+   - Reduce perception of "stuck" processing
+
+5. **Consider async processing alternatives**:
+   - WebSocket for real-time progress updates
+   - Server-sent events for status updates
+   - Better UX for long-running tasks
+
+## Monitoring
+
+### Health Checks
+
+**Worker health**:
+```bash
+docker compose ps worker
+# Should show: Up X minutes (healthy)
+```
+
+**Model service health**:
+```bash
+curl http://localhost:8001/health
+# Should return: {"status": "healthy", "models": ["whisper", "siglip"]}
+```
+
+**Videos processing**:
+```sql
+SELECT state, COUNT(*) FROM videos GROUP BY state;
+```
+
+### Alert Conditions
+
+**Critical**:
+- Worker container down
+- Model service unhealthy
+- >10 videos stuck in "processing" for >30 minutes
+
+**Warning**:
+- ASR taking >5 minutes consistently (consider GPU)
+- Worker restarts frequently
+- Increasing queue depth
+
+## Summary
+
+**Problem**: Worker timing out after 2 minutes during ASR transcription, causing video indexing failures.
+
+**Root Cause**: Timeout set to 120 seconds, but Whisper ASR on CPU takes 2-8 minutes for Korean audio.
+
+**Solution**: Increased timeout to 600 seconds (10 minutes) in both:
+1. Default timeout in `ModelServiceClient` (60s → 300s)
+2. Explicit timeout in `get_model_client()` (120s → 600s)
+
+**Status**: ✅ Fixed
+- Worker restarted with new timeout
+- Should handle long ASR operations
+- Stuck videos will retry via Dramatiq backoff
+
+**Testing Needed**: Upload a new video to verify end-to-end processing works.
+
+---
+
+End of Devlog

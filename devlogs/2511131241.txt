@@ -1,0 +1,357 @@
+================================================================================
+DEVLOG: Search Accuracy Investigation & Recommendations
+================================================================================
+Date: 2025-11-13 12:41 (Local) / 03:41 UTC
+Session: Investigating why semantic search returns 0 results for valid queries
+
+================================================================================
+SESSION OVERVIEW
+================================================================================
+
+User reported that searches are not finding scenes they know exist in uploaded
+videos. Specifically:
+- Search for "8927" works (finds 1 result via metadata match on title "IMG_8927")
+- Search for "two asian girls" returns 0 results
+- Search for "people at the restaurant" returns 0 results
+- Count query shows 2 total scenes exist
+
+Root cause: Silent videos (no transcripts) with only visual embeddings, but the
+search query filtering and scoring logic doesn't properly surface semantic visual
+matches.
+
+Files analyzed:
+- api/app/search/routes.py (search endpoint logic)
+- Database schema and scene data
+- Environment configuration
+
+================================================================================
+DIAGNOSTIC FINDINGS
+================================================================================
+
+## 1. Video Data Status
+
+Checked database for indexed videos:
+```sql
+SELECT v.storage_key, vm.title, COUNT(s.scene_id) as scenes
+FROM videos v
+LEFT JOIN video_metadata vm ON v.video_id = vm.video_id
+LEFT JOIN scenes s ON v.video_id = s.video_id
+WHERE v.state = 'indexed'
+GROUP BY v.storage_key, vm.title;
+```
+
+Results:
+- 2 indexed videos: IMG_8927 and IMG_8948
+- Each video has 1 scene
+- Titles: "IMG_8927", "IMG_8948"
+- Descriptions: NULL (empty)
+- Tags: NULL (empty)
+
+## 2. Scene Embedding Status
+
+Checked what data exists for scenes:
+```sql
+SELECT
+    s.scene_id,
+    v.storage_key,
+    vm.title,
+    LENGTH(s.transcript) as transcript_len,
+    s.text_vec IS NOT NULL as has_text_vec,
+    s.image_vec IS NOT NULL as has_image_vec,
+    s.tsv IS NOT NULL as has_tsv
+FROM scenes s
+JOIN videos v ON s.video_id = v.video_id
+LEFT JOIN video_metadata vm ON v.video_id = vm.video_id
+WHERE v.state = 'indexed';
+```
+
+Results:
+```
+scene_id                             | storage_key  | title    | transcript_len | text_vec | image_vec | tsv
+44991af5-f36e-489c-925d-32e087589c04 | .../IMG_8927 | IMG_8927 |              0 | t        | t         | f
+7e9185b2-a726-4917-946b-8ef2e89dd760 | .../IMG_8948 | IMG_8948 |              0 | t        | t         | f
+```
+
+Key findings:
+- ✅ Both scenes have text_vec (1152-dim SigLIP text embeddings)
+- ✅ Both scenes have image_vec (1152-dim SigLIP image embeddings)
+- ❌ Both scenes have NO transcripts (transcript_len = 0, likely silent videos)
+- ❌ Both scenes have NO full-text search vectors (tsv = f, no BM25 indexing)
+
+## 3. Search Configuration
+
+Environment variables:
+```
+FEATURE_SEMANTIC_SEARCH=true
+SEARCH_TEXT_WEIGHT=0.1  (10% weight on text embeddings)
+SEARCH_VISION_WEIGHT=0.9  (90% weight on vision embeddings)
+SEARCH_PERSON_BOOST=0.3  (30% bonus if person detected)
+```
+
+Model service status:
+- ✅ Model service running and healthy
+- ✅ SigLIP models downloaded (google/siglip-so400m-patch14-384)
+- ✅ Embedding generation working (confirmed 1152-dim outputs)
+
+## 4. Search Query Analysis
+
+For query "two asian girls":
+1. ✅ Text embedding generated successfully
+2. ✅ Semantic search path activated (FEATURE_SEMANTIC_SEARCH=true)
+3. ✅ Hybrid search query executed (metadata + semantic + keyword)
+4. ❌ Results: 0 scenes returned
+5. ⚠️  Count: 2 total scenes (mismatch!)
+
+The search executes two queries:
+a) Main query: WITH metadata_matches + scene_scores (lines 126-228)
+b) Count query: Simple COUNT of matching scenes (lines 325-375)
+
+Main query filters at line 221-226:
+```sql
+WHERE (
+    ss.text_similarity > 0
+    OR ss.vision_similarity > 0
+    OR ss.transcript_score > 0
+    OR mm.metadata_score > 0
+)
+```
+
+This WHERE clause requires at least ONE score to be > 0, BUT:
+- metadata_score = 0 (no match in title/description/tags/storage_key)
+- transcript_score = 0 (no transcripts exist)
+- text_similarity = ??? (might be > 0 but filtered later)
+- vision_similarity = ??? (might be > 0 but filtered later)
+
+## 5. Scoring Weights
+
+From api/app/search/routes.py:214-217:
+```python
+(
+    COALESCE(mm.metadata_score, 0) * 0.3 +  # 30% metadata
+    (ss.text_similarity * :text_weight + ss.vision_similarity * :vision_weight) * 0.5 +  # 50% semantic
+    ss.transcript_score * 0.2 +  # 20% transcript keyword
+    ss.person_boost_score  # Bonus for person match
+) AS final_score
+```
+
+With config SEARCH_TEXT_WEIGHT=0.1 and SEARCH_VISION_WEIGHT=0.9:
+- Metadata: 30% weight
+- Semantic: 50% weight = (text_sim * 0.1 + vision_sim * 0.9) * 0.5
+  - Text component: 5% (0.1 * 0.5)
+  - Vision component: 45% (0.9 * 0.5)
+- Transcript: 20% weight
+- Person: +30% bonus
+
+For silent videos with no metadata match:
+- Metadata: 0 * 0.3 = 0
+- Text embeddings: text_sim * 0.1 * 0.5 = text_sim * 0.05 (very small)
+- Vision embeddings: vision_sim * 0.9 * 0.5 = vision_sim * 0.45 (main signal!)
+- Transcript: 0 * 0.2 = 0
+- Person: 0 (not filtered by person)
+
+So final_score depends almost entirely on vision_similarity * 0.45
+
+================================================================================
+PROBLEM IDENTIFIED
+================================================================================
+
+The issue is likely one of these:
+
+1. **Low Similarity Scores**: The cosine similarity between query embedding
+   and scene image_vec might be very low (close to 0), causing final_score
+   to be too low to be meaningful.
+
+2. **Metadata-Only Filtering**: The metadata_matches CTE (lines 127-155) only
+   includes videos where metadata matches. For "two asian girls" query, neither
+   IMG_8927 nor IMG_8948 title matches, so the metadata_matches CTE returns 0
+   videos. Then the LEFT JOIN at line 220 makes mm.metadata_score = NULL (0),
+   but the scenes still pass the WHERE filter at 221-226 if vision_similarity > 0.
+
+3. **Text Embedding Mismatch**: The scene text_vec exists but might be derived
+   from empty transcripts or minimal metadata, making text_similarity meaningless.
+
+4. **No Results Despite Passing Filter**: If vision_similarity > 0 but very low
+   (e.g., 0.01), the final_score would be ~0.0045 (0.01 * 0.45), which is non-zero
+   but might not be returned due to ordering or other issues.
+
+================================================================================
+RECOMMENDATIONS TO IMPROVE SEARCH ACCURACY
+================================================================================
+
+## Immediate Fixes
+
+### 1. Remove Metadata Filtering from metadata_matches CTE
+
+**Current Issue**: The metadata_matches CTE (lines 147-152) filters videos
+where metadata matches the pattern:
+```sql
+AND (
+    LOWER(vm.title) LIKE LOWER(:pattern)
+    OR LOWER(vm.description) LIKE LOWER(:pattern)
+    OR LOWER(v.storage_key) LIKE LOWER(:pattern)
+    OR vm.tags::text ILIKE :pattern
+)
+```
+
+This means videos without metadata matches are excluded from metadata_matches,
+and then LEFT JOINed as NULL. But this is fine because the scene_scores CTE
+doesn't depend on metadata_matches.
+
+**Actually, this is NOT the issue** - the LEFT JOIN should still include all
+scenes from scene_scores even if no metadata match.
+
+### 2. Add Minimum Similarity Threshold (Configurable)
+
+Instead of filtering WHERE score > 0, use a meaningful threshold:
+```sql
+WHERE (
+    ss.text_similarity > :min_text_similarity
+    OR ss.vision_similarity > :min_vision_similarity
+    OR ss.transcript_score > 0
+    OR mm.metadata_score > 0
+)
+```
+
+Add config:
+```python
+search_min_text_similarity: float = 0.1  # ~10% similarity required
+search_min_vision_similarity: float = 0.1  # ~10% similarity required
+```
+
+### 3. Log Similarity Scores for Debugging
+
+Add logging in api/app/search/routes.py after fetching rows:
+```python
+for row in rows:
+    logger.info(
+        f"[search] Scene {row.scene_id}: "
+        f"vision={row.vision_similarity:.3f}, "
+        f"text={row.text_similarity:.3f}, "
+        f"metadata={row.metadata_score:.3f}, "
+        f"transcript={row.transcript_score:.3f}, "
+        f"final={row.final_score:.3f}"
+    )
+```
+
+This will help identify if scenes are being scored but filtered out.
+
+### 4. Increase Vision Weight in Final Score
+
+Current: 50% semantic * 90% vision = 45% vision weight total
+Recommended: 70% semantic * 90% vision = 63% vision weight total
+
+```python
+# In search query final_score calculation (line 214):
+(
+    COALESCE(mm.metadata_score, 0) * 0.2 +  # 20% metadata (reduced from 30%)
+    (ss.text_similarity * :text_weight + ss.vision_similarity * :vision_weight) * 0.7 +  # 70% semantic (increased from 50%)
+    ss.transcript_score * 0.1 +  # 10% transcript (reduced from 20%)
+    ss.person_boost_score  # Bonus for person match
+) AS final_score
+```
+
+### 5. Return Results with Zero Metadata Match
+
+Ensure scene_scores CTE doesn't require metadata matches. Current query at
+line 189-197 only filters by:
+- User ID
+- Video state = indexed
+- Has embeddings OR transcript
+- Person filter (if specified)
+- Duration filters
+
+This looks correct - it doesn't require metadata match. So the issue is elsewhere.
+
+### 6. Check for Empty or Invalid Embeddings
+
+Verify that text_vec and image_vec actually contain meaningful vectors:
+```sql
+-- Check embedding vectors are not all zeros or null
+SELECT
+    scene_id,
+    v.storage_key,
+    (SELECT COUNT(*) FROM unnest(s.image_vec) as val WHERE val != 0) as non_zero_image_dims,
+    (SELECT COUNT(*) FROM unnest(s.text_vec) as val WHERE val != 0) as non_zero_text_dims
+FROM scenes s
+JOIN videos v ON s.video_id = v.video_id
+WHERE v.state = 'indexed';
+```
+
+If all dimensions are 0, embeddings weren't generated properly.
+
+## Long-Term Improvements
+
+### 1. Add Explain Analysis Logging
+
+Log the full query execution plan when SEARCH_DEBUG=true:
+```python
+if settings.search_debug:
+    explain_result = await db.execute(text(f"EXPLAIN ANALYZE {query_sql}"))
+    logger.debug(f"Query plan: {explain_result.fetchall()}")
+```
+
+### 2. Implement Search Result Ranking Metrics
+
+Track search quality metrics:
+- Query -> Results count
+- Query -> Top 5 scores
+- Query -> Match types (metadata/semantic/transcript)
+- Zero-result queries (for improvement)
+
+### 3. Add Video Preview/Tags During Upload
+
+Improve metadata by:
+- Auto-generating video tags from first frame using vision model
+- Extracting scene descriptions using BLIP/LLaVA models
+- Allowing users to add titles/descriptions during upload
+
+### 4. Enable Hybrid RRF Search
+
+Currently disabled (FEATURE_SEARCH_SYS_HYBRID_RRF=false). Enable this for
+better fusion of BM25 + vector search.
+
+### 5. Implement Relevance Feedback
+
+Allow users to mark results as relevant/irrelevant to improve ranking:
+- Store feedback in database
+- Use feedback to adjust scoring weights per user
+- Implement learning-to-rank models
+
+================================================================================
+NEXT STEPS (IMMEDIATE)
+================================================================================
+
+1. **Add Similarity Score Logging** (Quick win)
+   - Add logger.info() after row fetch to see actual scores
+   - Determine if scenes are scored but filtered, or not scored at all
+
+2. **Check Embedding Validity** (Quick check)
+   - Run query to verify embeddings aren't all zeros
+   - Check if text_vec was generated from empty string (meaningless)
+
+3. **Lower Final Score Threshold** (Test hypothesis)
+   - Change WHERE (vision_similarity > 0) to (vision_similarity > 0.05)
+   - Or remove threshold entirely for testing
+
+4. **Test Direct Vector Similarity** (Isolate issue)
+   - Run raw SQL query with hardcoded embedding to test similarity
+   - Compare with what the API is doing
+
+5. **Re-index Videos with Better Metadata** (Data quality)
+   - Add descriptive titles/tags to test videos
+   - Or trigger re-processing to regenerate embeddings
+
+================================================================================
+RELATED ISSUES
+================================================================================
+
+Previous devlogs:
+- devlogs/2511131133.txt - Fixed NULL parameter type casting
+- devlogs/2511131652.txt - Implemented comprehensive hybrid search
+
+Context:
+The hybrid search was implemented and SQL errors were fixed, but the semantic
+search quality for silent videos (no transcripts) with minimal metadata needs
+improvement. The visual embeddings exist but aren't surfacing results as expected.
+
+================================================================================

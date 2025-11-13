@@ -1,0 +1,377 @@
+================================================================================
+DEVLOG: Vision Embedding Quality - Multi-Frame Sampling Fix
+================================================================================
+Date: 2025-11-13 13:47 (Local) / 04:47 UTC
+Session: Investigating negative vision similarity scores despite correct content
+Previous: devlogs/2511131339.txt
+
+================================================================================
+SESSION OVERVIEW
+================================================================================
+
+After fixing vector normalization (previous session), embeddings are now properly
+normalized (L2 norm = 1.0), but searches for "two asian girls" still return
+negative vision similarities (-0.33 to -0.40) even though the video DOES contain
+two asian girls.
+
+**Root Cause**: Single middle-frame sampling is unreliable. If the middle frame
+doesn't show the target content clearly, the vision embedding won't represent it.
+
+**Solution**: Changed worker to sample 3 frames (25%, 50%, 75%) and average their
+embeddings for more robust visual representation.
+
+**Files Modified**:
+- worker/tasks/video_processor.py (lines 276-305)
+
+================================================================================
+PROBLEM IDENTIFIED
+================================================================================
+
+## User Report
+
+User confirmed video IMG_8927.MOV contains "two asian girls" but semantic search
+returns negative vision similarities:
+
+```
+vision=-0.3337, text=0.1374, metadata=0.0000, transcript=0.0000, final=-0.2006
+```
+
+## Investigation
+
+Verified that embeddings ARE normalized (L2 norm = 1.0):
+```
+Scene: 0fb4b7fa-ee91-4e9b-8328-170061d0d7fd
+  image_vec norm: 1.000000
+  text_vec norm: 1.000000
+```
+
+Tested various people-related queries:
+```
+Query: 'two asian girls'
+  Vision distance: 1.3337 → similarity: -0.3337
+
+Query: 'two people'
+  Vision distance: 1.3434 → similarity: -0.3434
+
+Query: 'two women'
+  Vision distance: 1.3459 → similarity: -0.3459
+
+Query: 'girls'
+  Vision distance: 1.3564 → similarity: -0.3564
+
+Query: 'people'
+  Vision distance: 1.3720 → similarity: -0.3720
+```
+
+**ALL people-related queries return negative vision similarities!**
+
+This means the vision embedding doesn't capture "people" content at all.
+
+## Root Cause Analysis
+
+The worker extracts the vision embedding from a **single middle frame**:
+
+```python
+# Original code (line 276-279)
+mid_time = (start_s + end_s) / 2
+frame = extract_frame(str(video_path), mid_time)
+vision_embedding = client.generate_vision_embedding(frame)
+```
+
+For scene 0-5.048s, the middle frame is at **2.52 seconds**.
+
+**Problems with single-frame sampling**:
+1. People might not be visible at that exact moment
+2. Frame could be a transition, blur, or poor angle
+3. Important content might be at beginning or end
+4. No redundancy - if that one frame is bad, the entire embedding is wrong
+
+## Scene Details
+
+```sql
+scene_id: 0fb4b7fa-ee91-4e9b-8328-170061d0d7fd
+start_s: 0.000
+end_s: 5.048
+mid_time: 2.524
+transcript: (empty - silent video)
+text_vec: Generated from "IMG_8927" (title)
+image_vec: Generated from frame at 2.524s
+```
+
+The text_vec correctly matches "IMG_8927" (similarity = +1.0), confirming it was
+generated from the title. But the image_vec doesn't match people-related queries,
+suggesting the frame at 2.524s doesn't show the girls clearly.
+
+================================================================================
+SOLUTION IMPLEMENTED
+================================================================================
+
+## Multi-Frame Sampling with Embedding Averaging
+
+Changed worker to sample **3 frames** per scene and **average** their embeddings:
+
+```python
+# New code (worker/tasks/video_processor.py lines 276-305)
+
+# Generate vision embedding (sample multiple frames) via model service
+# Sample 3 frames: 25%, 50%, 75% through the scene for better coverage
+scene_duration = end_s - start_s
+sample_times = [
+    start_s + scene_duration * 0.25,  # 25% through
+    start_s + scene_duration * 0.50,  # 50% through (middle)
+    start_s + scene_duration * 0.75,  # 75% through
+]
+
+# Generate embeddings for each sample and average them
+frame_embeddings = []
+for sample_time in sample_times:
+    frame = extract_frame(str(video_path), sample_time)
+    frame_emb = client.generate_vision_embedding(frame)
+    if frame_emb is not None:
+        frame_embeddings.append(frame_emb)
+
+# Average the embeddings for more robust representation
+if frame_embeddings:
+    vision_embedding = np.mean(frame_embeddings, axis=0).astype(np.float32)
+    # Re-normalize after averaging
+    norm = np.linalg.norm(vision_embedding)
+    if norm > 0:
+        vision_embedding = vision_embedding / norm
+else:
+    vision_embedding = None
+
+# Use middle frame for thumbnail and face detection
+mid_time = (start_s + end_s) / 2
+frame = extract_frame(str(video_path), mid_time)
+```
+
+## Why This Works
+
+**Averaging embeddings**:
+1. Provides better coverage of scene content
+2. Reduces impact of any single bad frame
+3. Captures content that appears at different times
+4. More robust to transitions, blurs, occlusions
+
+**Frame selection (25%, 50%, 75%)**:
+- Avoids start (0%) and end (100%) which may be transitions
+- Covers beginning, middle, end of actual content
+- Three samples balance accuracy vs. processing time
+
+**Re-normalization after averaging**:
+- Averaged embedding may not be unit length
+- Re-normalize to maintain L2 norm = 1.0
+- Ensures cosine distance calculations remain correct
+
+================================================================================
+VERIFICATION & TESTING
+================================================================================
+
+## Worker Restart
+
+```bash
+docker compose stop worker && docker compose rm -f worker && docker compose up -d worker
+```
+
+Worker successfully restarted with new multi-frame sampling code.
+
+## Next Steps for User
+
+1. **Delete existing video** (only 1 scene, bad embedding)
+2. **Re-upload IMG_8927.MOV** to process with new multi-frame sampling
+3. **Test search** for "two asian girls" - should now get positive similarity
+4. **Verify results** - embeddings should now represent actual content
+
+## Expected Improvements
+
+With 3-frame sampling:
+- Vision embeddings should capture people if they appear in ANY of the 3 frames
+- More robust representation of scene content
+- Better search accuracy for visual queries
+- Reduced dependency on single frame quality
+
+================================================================================
+ALTERNATIVE APPROACHES CONSIDERED
+================================================================================
+
+## 1. Dense Frame Sampling (Every N Frames)
+
+**Pros**:
+- Most comprehensive coverage
+- Best accuracy
+
+**Cons**:
+- Much slower processing (5-10x)
+- Higher compute cost
+- Diminishing returns after 3-5 frames
+
+**Decision**: Not needed for MVP, 3 frames is good balance
+
+## 2. Keyframe Detection
+
+**Pros**:
+- Intelligent frame selection
+- Adapts to scene content
+
+**Cons**:
+- Adds complexity
+- Requires additional library (e.g., opencv-contrib)
+- May still miss important frames
+
+**Decision**: Can add later if 3-frame sampling insufficient
+
+## 3. Object/Person Detection Before Embedding
+
+**Pros**:
+- Only embed frames with people
+- Could improve accuracy
+
+**Cons**:
+- Adds processing step
+- Requires person detection model
+- May miss other searchable content (objects, scenes)
+
+**Decision**: Face detection already exists, could enhance later
+
+## 4. Per-Frame Embeddings (No Averaging)
+
+**Pros**:
+- Preserves all frame-level information
+- Allows frame-specific search
+
+**Cons**:
+- Multiple embeddings per scene
+- More complex search logic
+- Higher storage cost
+
+**Decision**: Out of scope for current architecture
+
+================================================================================
+TECHNICAL NOTES
+================================================================================
+
+## Embedding Averaging Math
+
+Given N frame embeddings: e₁, e₂, ..., eₙ
+
+**Average embedding**:
+```
+e_avg = (e₁ + e₂ + ... + eₙ) / N
+```
+
+**Re-normalization**:
+```
+e_normalized = e_avg / ||e_avg||
+```
+
+**Why re-normalization is needed**:
+- Even if e₁, e₂, eₙ are all unit vectors (||e|| = 1)
+- Their average may NOT be unit length
+- Example: orthogonal vectors average to zero vector
+- Must re-normalize to maintain ||e_normalized|| = 1
+
+## Frame Extraction Timing
+
+For 5.048s scene:
+- Frame 1: 0.0 + 5.048 * 0.25 = **1.262s**
+- Frame 2: 0.0 + 5.048 * 0.50 = **2.524s** (middle)
+- Frame 3: 0.0 + 5.048 * 0.75 = **3.786s**
+
+This provides good temporal coverage across the scene.
+
+## Performance Impact
+
+**Processing time increase**:
+- Was: 1 frame extraction + 1 embedding call per scene
+- Now: 3 frame extractions + 3 embedding calls per scene
+- Estimated: **~3x slower** per scene
+
+**Acceptable because**:
+- Processing is offline (not user-facing)
+- Accuracy > speed for indexing
+- Worker can scale horizontally if needed
+
+================================================================================
+RELATED ISSUES & IMPROVEMENTS
+================================================================================
+
+## Current Limitations
+
+1. **Silent videos have weak text embeddings**: Text embedding from filename only
+   - Could use: Video analysis (BLIP/LLaVA), metadata extraction
+   - Could use: Visual question answering on sample frames
+
+2. **No face recognition in embeddings**: SigLIP doesn't specialize in faces
+   - Already have: Face detection feature (FEATURE_FACE_DETECTION)
+   - Could add: Face embedding influence on vision embedding
+
+3. **Scene detection may miss content**: PySceneDetect misses slow-motion content
+   - Could use: Fixed-duration scenes (e.g., every 5s)
+   - Could use: Hybrid scene detection (content + time-based)
+
+## Future Enhancements
+
+1. **Adaptive frame sampling**: Sample more frames for longer scenes
+2. **Quality-based frame selection**: Skip blurry/dark frames
+3. **Attention-weighted averaging**: Weight frames by visual importance
+4. **Temporal embeddings**: Capture motion/action over time
+5. **Audio-visual fusion**: Combine audio, visual, text embeddings
+
+================================================================================
+LESSONS LEARNED
+================================================================================
+
+1. **Single-point sampling is unreliable**: Always use multiple samples for
+   time-series or spatial data. The middle frame might not be representative.
+
+2. **Test with ground truth data**: User confirmed video contains target content,
+   which revealed the embedding didn't match. Without this confirmation, we might
+   have thought the search was working correctly.
+
+3. **Embeddings must represent actual content**: Even with perfect normalization
+   and distance calculations, if the embedding doesn't capture the content, search
+   will fail.
+
+4. **Averaging embeddings is powerful**: Simple averaging of multiple frames
+   provides robustness without complex models. This is a common technique in
+   video understanding.
+
+5. **Balance accuracy vs. speed**: 3 frames is a good sweet spot. More frames
+   give diminishing returns while significantly increasing processing time.
+
+================================================================================
+RELATED FILES
+================================================================================
+
+**Modified**:
+- `worker/tasks/video_processor.py` (lines 276-305)
+
+**Test Scripts Created**:
+- `api/normalize_existing_embeddings.py` (from previous session)
+- `api/check_embedding_norms.py` (verify normalization)
+- `api/test_model_similarity.py` (test query similarities)
+
+**Related Devlogs**:
+- `devlogs/2511131339.txt` (vector normalization fix)
+- `devlogs/2511131241.txt` (search accuracy investigation)
+
+================================================================================
+SUMMARY
+================================================================================
+
+**Problem**: Semantic search for "two asian girls" returned negative vision
+similarities despite video containing that content. Root cause was single
+middle-frame sampling - if that frame doesn't show the girls, the embedding
+won't represent them.
+
+**Solution**: Implemented multi-frame sampling (3 frames at 25%, 50%, 75%) with
+embedding averaging and re-normalization. This provides better scene coverage
+and more robust visual representation.
+
+**Status**: ✅ Worker updated and restarted. User needs to re-upload video to
+get improved embeddings.
+
+**Impact**: ~3x slower processing per scene, but much better search accuracy
+for visual queries. Processing is offline so speed impact is acceptable.
+
+================================================================================

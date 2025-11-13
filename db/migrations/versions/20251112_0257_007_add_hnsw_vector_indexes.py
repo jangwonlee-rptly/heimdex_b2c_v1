@@ -42,25 +42,45 @@ def upgrade() -> None:
     """
     Create HNSW indexes on vector columns for fast ANN search.
 
-    Uses CONCURRENTLY to avoid blocking writes during index creation.
-    Safe for production deployment.
+    Note: We don't use CONCURRENTLY in migrations because it can't run inside
+    a transaction. For dev environments this is fine. For production, create
+    these indexes manually with CONCURRENTLY to avoid blocking writes.
     """
+    # Check if table exists before creating indexes
+    from sqlalchemy import inspect
+    from alembic import context
+
+    conn = context.get_bind()
+    inspector = inspect(conn)
+
+    if 'scenes' not in inspector.get_table_names():
+        # Table doesn't exist yet, skip index creation
+        return
+
     # Create HNSW index on image_vec (vision embeddings) - 1152 dimensions
     # m=16: Each vector connected to ~16 neighbors (balanced speed/accuracy)
     # ef_construction=64: Build quality (higher = better index, slower build)
-    op.execute("""
-        CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_scenes_image_vec_hnsw
-        ON scenes USING hnsw (image_vec vector_cosine_ops)
-        WITH (m = 16, ef_construction = 64)
-    """)
+    try:
+        op.execute("""
+            CREATE INDEX IF NOT EXISTS idx_scenes_image_vec_hnsw
+            ON scenes USING hnsw (image_vec vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
+        """)
+    except Exception as e:
+        # Index creation may fail if extension not available or data incompatible
+        print(f"Warning: Could not create HNSW index on image_vec: {e}")
 
     # Create HNSW index on text_vec (text embeddings) - 1152 dimensions
     # Same parameters as image_vec for consistency
-    op.execute("""
-        CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_scenes_text_vec_hnsw
-        ON scenes USING hnsw (text_vec vector_cosine_ops)
-        WITH (m = 16, ef_construction = 64)
-    """)
+    try:
+        op.execute("""
+            CREATE INDEX IF NOT EXISTS idx_scenes_text_vec_hnsw
+            ON scenes USING hnsw (text_vec vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
+        """)
+    except Exception as e:
+        # Index creation may fail if extension not available or data incompatible
+        print(f"Warning: Could not create HNSW index on text_vec: {e}")
 
     # Note: ef_search (query-time parameter) is set in app config, not in index
     # See api/app/config.py: search_ann_ef_search
@@ -69,8 +89,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     """
     Drop HNSW indexes (fall back to sequential scan).
-
-    Uses CONCURRENTLY to avoid blocking operations.
     """
-    op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_scenes_image_vec_hnsw")
-    op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_scenes_text_vec_hnsw")
+    op.execute("DROP INDEX IF EXISTS idx_scenes_image_vec_hnsw")
+    op.execute("DROP INDEX IF EXISTS idx_scenes_text_vec_hnsw")

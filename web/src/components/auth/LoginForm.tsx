@@ -23,6 +23,11 @@ export function LoginForm() {
 
     try {
       const response = await api.login({ email, password });
+
+      // Store tokens in localStorage for subsequent requests
+      localStorage.setItem('access_token', response.access_token);
+      localStorage.setItem('refresh_token', response.refresh_token);
+
       setUser(response.user);
       router.push('/dashboard');
     } catch (err: any) {

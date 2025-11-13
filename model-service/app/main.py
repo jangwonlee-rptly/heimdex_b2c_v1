@@ -266,7 +266,8 @@ class ModelManager:
             processor = AutoProcessor.from_pretrained(
                 model_path,
                 cache_dir=cache_dir,
-                local_files_only=True
+                local_files_only=True,
+                use_fast=True
             )
             model = AutoModel.from_pretrained(
                 model_path,

@@ -179,8 +179,6 @@ services:
       HF_HOME: /app/models/.cache
       HF_HUB_CACHE: /app/models/.cache
       XDG_CACHE_HOME: /app/models/.cache  # For Whisper
-      # GPU configuration
-      CUDA_VISIBLE_DEVICES: "0"
       # Prevent auto-downloads (fail fast if models missing)
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -199,11 +197,6 @@ services:
         limits:
           cpus: '4'
           memory: 6G  # Optimized: Whisper 2.9GB + SigLIP 1.6GB + overhead
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s

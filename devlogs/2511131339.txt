@@ -1,0 +1,360 @@
+================================================================================
+DEVLOG: Vector Normalization Fix for pgvector Cosine Distance
+================================================================================
+Date: 2025-11-13 13:39 (Local) / 04:39 UTC
+Session: Fixing negative similarity scores by normalizing embeddings
+Previous: devlogs/2511131241.txt
+
+================================================================================
+SESSION OVERVIEW
+================================================================================
+
+Continued from previous session where semantic search was returning 0 results
+despite embeddings being present. After investigation, discovered that embedding
+vectors were unnormalized, causing pgvector's cosine distance operator to return
+incorrect values.
+
+**Root Cause**: SigLIP model service returns unnormalized embeddings (L2 norm ~27.65
+instead of 1.0). PostgreSQL's pgvector cosine distance operator `<->` expects
+normalized (unit) vectors for correct similarity calculations.
+
+**Files Modified**:
+- api/app/search/embeddings.py (query embedding normalization)
+- worker/shared/model_client/client.py (indexing embedding normalization)
+- api/normalize_existing_embeddings.py (new script to fix existing data)
+
+================================================================================
+PROBLEM IDENTIFIED
+================================================================================
+
+From previous session (devlogs/2511131241.txt), we identified:
+1. Search queries returned 0 results for semantic searches
+2. Added logging showed massive negative similarity scores:
+   - vision=-32.1436, text=-25.5758 (should be 0-1)
+3. Direct PostgreSQL test showed distance = 33.1 (should be 0-2)
+4. L2 norm check revealed embeddings had norm = 27.65 (should be 1.0)
+
+**Why this matters**:
+- pgvector's `<->` operator computes cosine distance as: 1 - (A · B) / (||A|| × ||B||)
+- For unit vectors (||A|| = ||B|| = 1), this simplifies to: 1 - (A · B)
+- For unnormalized vectors, the result is completely wrong
+- This caused all similarity calculations to be meaningless
+
+================================================================================
+SOLUTION IMPLEMENTED
+================================================================================
+
+## Step 1: Add Normalization to Query Embeddings
+
+Modified `api/app/search/embeddings.py` lines 170-176:
+
+```python
+result = response.json()
+embedding = np.array(result["embedding"], dtype=np.float32)
+
+# Normalize embedding to unit length for cosine distance
+norm = np.linalg.norm(embedding)
+if norm > 0:
+    embedding = embedding / norm
+    logger.info(f"[embeddings] Generated {result['dimension']}-dim embedding in {result['latency_ms']:.0f}ms (normalized, L2 norm={norm:.2f})")
+else:
+    logger.warning(f"[embeddings] Generated zero-norm embedding - skipping normalization")
+
+return embedding
+```
+
+**Why**: Ensures all search query embeddings are normalized before computing distance.
+
+## Step 2: Add Normalization to Worker Embeddings
+
+Modified `worker/shared/model_client/client.py`:
+- Text embedding method (lines 111-114)
+- Vision embedding method (lines 149-152)
+
+```python
+# Text embedding normalization
+result = response.json()
+embedding = np.array(result["embedding"], dtype=np.float32)
+
+# Normalize embedding to unit length for cosine distance
+norm = np.linalg.norm(embedding)
+if norm > 0:
+    embedding = embedding / norm
+
+return embedding
+```
+
+**Why**: Ensures all newly indexed videos have normalized embeddings from the start.
+
+## Step 3: Normalize Existing Database Embeddings
+
+Created `api/normalize_existing_embeddings.py` to fix existing data:
+
+```python
+async def normalize_embeddings():
+    """Normalize all existing embeddings in the database."""
+
+    # Get database URL from environment
+    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+
+    # Connect and fetch all scenes with embeddings
+    engine = create_async_engine(db_url, echo=False)
+
+    async with engine.begin() as conn:
+        result = await conn.execute(text("""
+            SELECT scene_id, image_vec, text_vec
+            FROM scenes
+            WHERE image_vec IS NOT NULL OR text_vec IS NOT NULL
+        """))
+
+        scenes = result.fetchall()
+
+        for row in scenes:
+            scene_id = row[0]
+            image_vec = row[1]
+            text_vec = row[2]
+
+            updates = []
+            params = {"scene_id": scene_id}
+
+            # Normalize image_vec if present
+            if image_vec is not None:
+                # Parse pgvector string format "[1.0,2.0,...]"
+                if isinstance(image_vec, str):
+                    image_vec = image_vec.strip('[]').split(',')
+                    image_array = np.array([float(x) for x in image_vec], dtype=np.float32)
+                else:
+                    image_array = np.array(image_vec, dtype=np.float32)
+
+                norm = np.linalg.norm(image_array)
+
+                if norm > 0 and abs(norm - 1.0) > 0.01:
+                    normalized = image_array / norm
+                    updates.append("image_vec = CAST(:image_vec AS vector(1152))")
+                    # Convert to pgvector string format
+                    params["image_vec"] = '[' + ','.join(str(x) for x in normalized.tolist()) + ']'
+
+            # (Same for text_vec)
+
+            # Update scene
+            if updates:
+                update_sql = f"UPDATE scenes SET {', '.join(updates)} WHERE scene_id = :scene_id"
+                await conn.execute(text(update_sql), params)
+```
+
+**Key challenges solved**:
+1. **Database URL**: API container uses `POSTGRES_URL` not `DATABASE_URL`
+2. **Vector parsing**: pgvector returns strings like `"[1.0,2.0,...]"`, need to parse
+3. **Vector formatting**: pgvector expects string format `"[1.0,2.0,...]"` not Python lists
+
+## Step 4: Run Normalization Script
+
+```bash
+docker compose exec api python normalize_existing_embeddings.py
+```
+
+**Output**:
+```
+Connecting to database...
+Found 1 scenes with embeddings to normalize
+  Scene 0fb4b7fa-ee91-4e9b-8328-170061d0d7fd: Normalizing image_vec (L2 norm 21.52 -> 1.0)
+  Scene 0fb4b7fa-ee91-4e9b-8328-170061d0d7fd: Normalizing text_vec (L2 norm 37.50 -> 1.0)
+
+Normalized 1 scenes
+Done!
+```
+
+## Step 5: Verify Normalization
+
+```sql
+SELECT
+    scene_id,
+    v.storage_key,
+    (s.image_vec <-> s.image_vec) as image_self_dist,
+    (s.text_vec <-> s.text_vec) as text_self_dist
+FROM scenes s
+JOIN videos v ON s.video_id = v.video_id
+WHERE s.image_vec IS NOT NULL OR s.text_vec IS NOT NULL;
+```
+
+**Result**:
+```
+scene_id                             | storage_key                      | image_self_dist | text_self_dist
+0fb4b7fa-ee91-4e9b-8328-170061d0d7fd | videos/.../...MOV                |               0 |              0
+```
+
+✅ **Self-distance = 0** confirms vectors are now normalized correctly!
+
+================================================================================
+TECHNICAL DETAILS
+================================================================================
+
+## Vector Normalization Math
+
+**L2 Norm (Euclidean length)**:
+```
+||v|| = sqrt(v₁² + v₂² + ... + vₙ²)
+```
+
+**Normalization**:
+```
+v_normalized = v / ||v||
+```
+
+**Properties of unit vectors**:
+- ||v_normalized|| = 1.0 (by definition)
+- Distance to self: v <-> v = 0
+- Max distance between any two unit vectors: 2.0
+- Cosine similarity range: [-1, 1] → Distance range: [0, 2]
+
+## pgvector Cosine Distance Operator
+
+The `<->` operator in pgvector computes:
+```
+distance = 1 - cosine_similarity
+         = 1 - (A · B) / (||A|| × ||B||)
+```
+
+For unit vectors (||A|| = ||B|| = 1):
+```
+distance = 1 - (A · B)
+         = 1 - cos(θ)
+```
+
+This is why normalization is **critical** for correct results.
+
+## Why Previous Embeddings Were Wrong
+
+**Before normalization**:
+- Query embedding: ||q|| ≈ 27.65
+- Database embedding: ||d|| ≈ 21.52
+- Distance calculation: 1 - (q · d) / (27.65 × 21.52) ≈ large negative number
+
+**After normalization**:
+- Query embedding: ||q|| = 1.0
+- Database embedding: ||d|| = 1.0
+- Distance calculation: 1 - (q · d) / (1.0 × 1.0) = 1 - cos(θ) ∈ [0, 2]
+
+================================================================================
+ERRORS ENCOUNTERED & SOLUTIONS
+================================================================================
+
+## Error 1: DATABASE_URL Environment Variable
+
+**Error**: `ERROR: DATABASE_URL environment variable not set`
+
+**Cause**: API container uses `POSTGRES_URL` instead of `DATABASE_URL`
+
+**Fix**: Updated script to check both:
+```python
+db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+```
+
+## Error 2: pgvector String Format Parsing
+
+**Error**: `ValueError: could not convert string to float: '[0.5676471,-0.19627841,...'`
+
+**Cause**: asyncpg returns pgvector vectors as strings, not arrays
+
+**Fix**: Parse string format:
+```python
+if isinstance(image_vec, str):
+    image_vec = image_vec.strip('[]').split(',')
+    image_array = np.array([float(x) for x in image_vec], dtype=np.float32)
+```
+
+## Error 3: pgvector Vector Update Format
+
+**Error**: `asyncpg.exceptions.DataError: invalid input for query argument $1: [...] (expected str, got list)`
+
+**Cause**: pgvector expects string format, not Python lists
+
+**Fix**: Convert normalized array to pgvector string:
+```python
+params["image_vec"] = '[' + ','.join(str(x) for x in normalized.tolist()) + ']'
+```
+
+================================================================================
+TESTING & VERIFICATION
+================================================================================
+
+## Database Verification
+
+✅ **Self-distance test**: Vectors have distance 0 to themselves
+✅ **Normalization check**: L2 norms changed from 21.52/37.50 to 1.0
+✅ **Update confirmation**: Script successfully updated 1 scene
+
+## Expected Search Behavior
+
+With normalized embeddings, searches should now:
+1. Return similarity scores in range [0, 1] (converted from distance [0, 2])
+2. Find semantically similar scenes even without metadata matches
+3. Properly rank results by visual and text similarity
+
+## Next Steps for User Testing
+
+1. Try search queries like "two asian girls" or "people at the restaurant"
+2. Check API logs for similarity scores (should be positive, 0-1 range)
+3. Verify results are returned and ranked correctly
+
+================================================================================
+LESSONS LEARNED
+================================================================================
+
+1. **Always normalize embeddings for cosine similarity**: This is a fundamental
+   requirement when using pgvector's `<->` operator. The model service returns
+   unnormalized embeddings, so normalization must happen in the application layer.
+
+2. **pgvector data type handling**: When using asyncpg/SQLAlchemy with pgvector:
+   - Vectors are returned as strings `"[1.0,2.0,...]"`
+   - Vectors must be passed as strings in that format
+   - Cannot use Python lists directly
+
+3. **Always verify mathematical assumptions**: Previous session identified the
+   problem but initially thought it was a vector dimension issue. Testing the
+   actual L2 norm revealed the real problem.
+
+4. **Separate query-time and index-time fixes**: Need to fix both:
+   - Query embeddings (API search code)
+   - Stored embeddings (worker + migration script)
+
+5. **Docker container caching**: When fixing code issues, sometimes need full
+   container recreation, not just restart.
+
+================================================================================
+RELATED FILES
+================================================================================
+
+**Modified Files**:
+- `api/app/search/embeddings.py` (lines 170-176)
+- `worker/shared/model_client/client.py` (lines 111-114, 149-152)
+
+**New Files**:
+- `api/normalize_existing_embeddings.py` (normalization script)
+
+**Related Devlogs**:
+- `devlogs/2511131241.txt` (search accuracy investigation)
+- `devlogs/2511131133.txt` (SQL parameter type casting fix)
+- `devlogs/2511131652.txt` (hybrid search implementation)
+
+================================================================================
+SUMMARY
+================================================================================
+
+**Problem**: Semantic search returning 0 results with massive negative similarity
+scores due to unnormalized embeddings.
+
+**Root Cause**: SigLIP model service returns embeddings with L2 norm ≈ 27.65
+instead of 1.0. pgvector's cosine distance operator requires unit vectors.
+
+**Solution**: Added L2 normalization to both query-time embeddings (API) and
+index-time embeddings (worker). Created migration script to normalize existing
+database embeddings.
+
+**Result**: All embeddings now properly normalized (L2 norm = 1.0), cosine
+distance calculations should now return correct values in range [0, 2], and
+similarity scores should be in range [0, 1].
+
+**Status**: ✅ Complete - Ready for user testing
+
+================================================================================

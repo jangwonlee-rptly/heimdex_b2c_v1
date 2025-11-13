@@ -17,13 +17,13 @@ import io
 class ModelServiceClient:
     """Client for model service inference endpoints."""
 
-    def __init__(self, base_url: Optional[str] = None, timeout: float = 60.0):
+    def __init__(self, base_url: Optional[str] = None, timeout: float = 300.0):
         """
         Initialize model service client.
 
         Args:
             base_url: Model service base URL (default: from MODEL_SERVICE_URL env)
-            timeout: Request timeout in seconds
+            timeout: Request timeout in seconds (default: 300s = 5 minutes for ASR)
         """
         self.base_url = base_url or os.getenv("MODEL_SERVICE_URL", "http://localhost:8001")
         self.timeout = timeout
@@ -106,7 +106,14 @@ class ModelServiceClient:
         response.raise_for_status()
 
         result = response.json()
-        return np.array(result["embedding"], dtype=np.float32)
+        embedding = np.array(result["embedding"], dtype=np.float32)
+
+        # Normalize embedding to unit length for cosine distance
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+
+        return embedding
 
     def generate_vision_embedding(
         self,
@@ -137,7 +144,14 @@ class ModelServiceClient:
         response.raise_for_status()
 
         result = response.json()
-        return np.array(result["embedding"], dtype=np.float32)
+        embedding = np.array(result["embedding"], dtype=np.float32)
+
+        # Normalize embedding to unit length for cosine distance
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+
+        return embedding
 
     def detect_faces(
         self,

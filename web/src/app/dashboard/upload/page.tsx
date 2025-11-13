@@ -59,18 +59,22 @@ export default function UploadPage() {
     try {
       // Step 1: Initialize upload
       setProgress(10);
-      const { upload_url, video_id } = await api.initVideoUpload(file);
+      const { upload_url, video_id } = await api.initVideoUpload({
+        filename: file.name,
+        mime_type: file.type,
+        size_bytes: file.size,
+        title,
+        description: description || undefined,
+      });
 
       // Step 2: Upload to storage
       setProgress(30);
-      await api.uploadVideo(upload_url, file);
+      await api.uploadVideoFile(upload_url, file);
 
       // Step 3: Complete upload
       setProgress(80);
       await api.completeVideoUpload({
         video_id,
-        title,
-        description: description || undefined,
       });
 
       setProgress(100);
