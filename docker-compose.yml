@@ -141,6 +141,8 @@ services:
       VISION_MODEL_NAME: ${VISION_MODEL_NAME:-google/siglip-so400m-patch14-384}
       LOAD_BGE_M3: ${LOAD_BGE_M3:-false}
       FEATURE_FACE: ${FEATURE_FACE:-false}
+      FEATURE_FACE_ENROLLMENT: ${FEATURE_FACE_ENROLLMENT:-false}
+      FEATURE_FACE_DETECTION: ${FEATURE_FACE_DETECTION:-false}
       # Unified cache configuration (shared across all ML frameworks)
       HF_HOME: /app/models/.cache
       HF_HUB_CACHE: /app/models/.cache

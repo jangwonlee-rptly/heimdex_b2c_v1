@@ -108,12 +108,12 @@ async def init_video_upload(
     # Generate unique storage key
     video_id = uuid4()
     file_extension = request.filename.split(".")[-1] if "." in request.filename else "mp4"
-    storage_key = f"videos/{user.user_id}/{video_id}.{file_extension}"
+    storage_key = f"videos/{user.supabase_user_id}/{video_id}.{file_extension}"
 
     # Create video record
     video = Video(
         video_id=video_id,
-        user_id=UUID(user.user_id),
+        user_id=UUID(user.supabase_user_id),
         storage_key=storage_key,
         mime_type=request.mime_type,
         size_bytes=request.size_bytes,
@@ -136,7 +136,7 @@ async def init_video_upload(
     logger.info(
         "Initialized video upload",
         video_id=str(video_id),
-        user_id=user.user_id,
+        user_id=user.supabase_user_id,
         storage_key=storage_key,
         size_bytes=request.size_bytes
     )
@@ -173,7 +173,7 @@ async def complete_video_upload(
     # Get video record
     stmt = select(Video).where(
         Video.video_id == UUID(request.video_id),
-        Video.user_id == UUID(user.user_id),
+        Video.user_id == UUID(user.supabase_user_id),
     )
     result = await db.execute(stmt)
     video = result.scalar_one_or_none()
@@ -206,7 +206,7 @@ async def complete_video_upload(
     logger.info(
         "Video upload completed, queued for processing",
         video_id=str(video.video_id),
-        user_id=user.user_id,
+        user_id=user.supabase_user_id,
         job_id=str(validation_job.job_id)
     )
 
@@ -269,7 +269,7 @@ async def list_videos(
     """
     # Get total count
     from sqlalchemy import func as sql_func
-    count_stmt = select(sql_func.count(Video.video_id)).where(Video.user_id == UUID(user.user_id))
+    count_stmt = select(sql_func.count(Video.video_id)).where(Video.user_id == UUID(user.supabase_user_id))
     total_result = await db.execute(count_stmt)
     total = total_result.scalar() or 0
 
@@ -277,7 +277,7 @@ async def list_videos(
     stmt = (
         select(Video)
         .options(selectinload(Video.video_metadata))
-        .where(Video.user_id == UUID(user.user_id))
+        .where(Video.user_id == UUID(user.supabase_user_id))
         .order_by(Video.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -364,7 +364,7 @@ async def get_video(
         .options(selectinload(Video.video_metadata))
         .where(
             Video.video_id == UUID(video_id),
-            Video.user_id == UUID(user.user_id),
+            Video.user_id == UUID(user.supabase_user_id),
         )
     )
     result = await db.execute(stmt)
@@ -430,7 +430,7 @@ async def get_video_status(
     # Get video
     stmt = select(Video).where(
         Video.video_id == UUID(video_id),
-        Video.user_id == UUID(user.user_id),
+        Video.user_id == UUID(user.supabase_user_id),
     )
     result = await db.execute(stmt)
     video = result.scalar_one_or_none()

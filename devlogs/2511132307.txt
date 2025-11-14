@@ -1,0 +1,379 @@
+# Devlog: Fixed Misleading Error Logs for Expired JWT Tokens
+Date: 2025-11-13 23:07 (Local) / 14:07 UTC
+Session Type: Bug Fix
+Status: ✅ FIXED
+
+## Session Overview
+
+Fixed misleading "Database session error" logs that appeared when JWT tokens expired. The authentication flow was working correctly (returning 401 Unauthorized), but the error logging made it appear as if there was a database problem when it was actually just an expired token.
+
+### Files Modified
+- `api/app/db.py` (improved exception handling in `get_db()` dependency)
+
+### Problem Statement
+
+When reloading the project from a different machine with an expired JWT token, the following error logs appeared:
+
+```
+INFO:     172.21.0.1:45690 - "GET /auth/me HTTP/1.1" 401 Unauthorized
+
+{"event": "Token expired", "level": "warning", "logger": "app.main", "timestamp": "2025-11-13T14:04:06.868842Z"}
+
+{"error": "", "event": "Database session error", "level": "error", "logger": "app.main", "timestamp": "2025-11-13T14:04:06.868996Z", "exception": "Traceback (most recent call last):\n  File \"/app/app/auth/middleware.py\", line 48, in verify_token\n    payload = jwt.decode(...)\njwt.exceptions.ExpiredSignatureError: Signature has expired\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/app/app/db.py\", line 56, in get_db\n    yield session\n  ...\nfastapi.exceptions.HTTPException"}
+```
+
+**User Impact**:
+- Confusing error logs that suggest database issues when there are none
+- Makes debugging harder as it obscures the real issue (expired token)
+- The 401 response was working correctly and redirecting to login page, but the logs were misleading
+
+## Root Cause Analysis
+
+### Exception Flow
+
+1. **Token Expiration**: User makes request with expired JWT token to `/auth/me`
+2. **Token Verification**: `verify_token()` in `middleware.py` decodes token and catches `jwt.ExpiredSignatureError`
+3. **HTTPException Raised**: At line 57, raises `HTTPException(status_code=401, detail="Token has expired")`
+4. **Database Dependency**: This exception occurs INSIDE `get_current_user()` which depends on `get_db()`
+5. **Broad Exception Handling**: `get_db()` catches ALL exceptions and logs them as "Database session error"
+
+### The Problem in get_db()
+
+```python
+# api/app/db.py (before fix)
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception as e:  # ❌ Too broad - catches HTTPExceptions too!
+            await session.rollback()
+            logger.error("Database session error", error=str(e), exc_info=True)
+            raise
+        finally:
+            await session.close()
+```
+
+**Issue**: The broad `except Exception as e` clause catches:
+- Actual database errors (IntegrityError, OperationalError, etc.) ✅
+- HTTPExceptions from authentication/authorization ❌
+- HTTPExceptions from validation errors ❌
+- Any other application-level errors ❌
+
+This logs ALL exceptions as "Database session error" even when they have nothing to do with the database.
+
+### Why This Happened
+
+FastAPI's dependency injection system works like this:
+
+1. Request comes in for `/auth/me`
+2. FastAPI resolves dependencies: `get_current_user(credentials, db=Depends(get_db))`
+3. `get_db()` yields a session
+4. `get_current_user()` runs and calls `verify_token()`
+5. `verify_token()` raises HTTPException
+6. Exception propagates back through `get_current_user()`
+7. FastAPI's dependency system triggers cleanup of `get_db()`
+8. The exception is caught in `get_db()`'s except block
+9. Logged as "Database session error" (misleading!)
+10. Exception re-raised, FastAPI converts to 401 response (correct!)
+
+So the HTTP response was correct, but the logging was wrong.
+
+## Solution Implemented
+
+### Separate HTTPException Handling
+
+Modified `get_db()` to distinguish between:
+1. **HTTPExceptions**: Application-level errors (auth, validation, etc.)
+2. **Other exceptions**: Actual database or unexpected errors
+
+```python
+# api/app/db.py (after fix)
+from fastapi import HTTPException  # Added import
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except HTTPException:
+            # HTTPExceptions are application-level errors (auth, validation, etc.)
+            # Rollback any uncommitted changes but don't log as database error
+            await session.rollback()
+            raise
+        except Exception as e:
+            # Actual database or unexpected errors
+            await session.rollback()
+            logger.error("Database session error", error=str(e), exc_info=True)
+            raise
+        finally:
+            await session.close()
+```
+
+### Key Changes
+
+1. **Added HTTPException import** (line 9)
+2. **Separate except clause** for HTTPExceptions (lines 59-63)
+   - Still rolls back the session (in case any DB operations were started)
+   - Does NOT log as "Database session error"
+   - Re-raises immediately for FastAPI to handle
+3. **Preserved original behavior** for actual database errors (lines 64-68)
+
+## Testing & Verification
+
+### Before Fix
+
+Logs when token expired:
+```
+INFO: "GET /auth/me HTTP/1.1" 401 Unauthorized
+{"event": "Token expired", "level": "warning", ...}
+{"event": "Database session error", "level": "error", ...}  ❌ Misleading!
+```
+
+### After Fix
+
+Expected logs when token expires:
+```
+INFO: "GET /auth/me HTTP/1.1" 401 Unauthorized
+{"event": "Token expired", "level": "warning", ...}
+```
+
+**No more "Database session error" for authentication issues!**
+
+### Verification Steps
+
+1. **Restarted API service**:
+   ```bash
+   docker compose restart api
+   ```
+
+2. **Service came up healthy**:
+   ```
+   {"event": "Database connection established", "level": "info", ...}
+   {"event": "Application startup complete", "level": "info", ...}
+   INFO: "GET /health HTTP/1.1" 200 OK
+   ```
+
+3. **Expected behavior with expired token**:
+   - HTTP 401 response (unchanged) ✅
+   - "Token expired" warning log (unchanged) ✅
+   - NO "Database session error" log (fixed!) ✅
+   - Automatic redirect to login (unchanged) ✅
+
+## Error Handling Best Practices
+
+### What Types of Exceptions to Catch Where
+
+**In dependency functions like `get_db()`:**
+- ❌ Don't catch application-level exceptions (HTTPException, validation errors)
+- ✅ Do catch resource-specific exceptions (database errors, file errors, etc.)
+- ✅ Do ensure cleanup happens (session close, file close, etc.)
+
+**In endpoint handlers:**
+- ✅ Do catch and handle business logic exceptions
+- ✅ Do raise HTTPExceptions for client errors
+- ❌ Don't catch HTTPExceptions (let FastAPI handle them)
+
+**In middleware/auth functions:**
+- ✅ Do raise HTTPExceptions for auth failures
+- ✅ Do log security-relevant events
+- ❌ Don't catch HTTPExceptions you just raised
+
+### Exception Hierarchy in FastAPI
+
+```
+BaseException
+├── Exception
+    ├── HTTPException (FastAPI)
+    │   ├── 401 Unauthorized
+    │   ├── 403 Forbidden
+    │   ├── 404 Not Found
+    │   └── ...
+    ├── SQLAlchemyError
+    │   ├── IntegrityError
+    │   ├── OperationalError
+    │   └── ...
+    └── Other Python exceptions
+```
+
+**Key insight**: HTTPException is a CONTROL FLOW mechanism, not an error condition. It tells FastAPI what HTTP response to send.
+
+### Logging Guidelines
+
+**Good logging:**
+```python
+except HTTPException:
+    # Don't log - FastAPI will handle and log the HTTP response
+    raise
+
+except IntegrityError as e:
+    logger.error("Database constraint violation", error=str(e), constraint=...)
+    raise
+```
+
+**Bad logging:**
+```python
+except Exception as e:
+    # ❌ Logs everything as generic "error", loses context
+    logger.error("Error occurred", error=str(e))
+    raise
+```
+
+## Related Files
+
+**Modified**:
+- `api/app/db.py` (lines 9, 59-68: exception handling)
+
+**Related**:
+- `api/app/auth/middleware.py` (raises HTTPException for expired tokens)
+- `api/app/main.py` (FastAPI exception handlers)
+
+## Lessons Learned
+
+### 1. Exception Handling Should Match Exception Type
+
+**Problem**: Catching `Exception` is too broad for cleanup code
+- HTTPExceptions are not exceptional conditions - they're HTTP responses
+- Logging them as "errors" is misleading
+
+**Solution**: Separate handling by exception type:
+```python
+except HTTPException:  # Application control flow
+    cleanup()
+    raise
+except DatabaseError:  # Actual errors
+    cleanup()
+    log_error()
+    raise
+```
+
+### 2. Dependencies Have Different Error Handling Needs
+
+**Database dependency**: Should only catch database-specific exceptions
+**File dependency**: Should only catch file I/O exceptions
+**Cache dependency**: Should only catch cache-specific exceptions
+
+**Not all exceptions in a dependency are dependency errors!**
+
+### 3. FastAPI Dependency Cleanup Is Always Called
+
+Even when exceptions are raised, FastAPI ensures:
+1. The `finally` block runs (session close)
+2. The `except` block runs if there's an exception
+3. The exception is then re-raised for FastAPI to handle
+
+So we need to be careful what we log in the `except` block.
+
+### 4. Control Flow vs Error Conditions
+
+**Control flow exceptions** (expected program flow):
+- HTTPException (401, 403, 404, etc.)
+- ValidationError
+- Custom business logic exceptions
+
+**Error conditions** (unexpected problems):
+- Database connection failures
+- Disk full
+- Out of memory
+- Network timeouts
+
+Don't log control flow as errors!
+
+### 5. Logging Should Provide Context, Not Confusion
+
+**Before**: "Database session error" when token expired
+- Developer thinks: "Is the database down?"
+- Actual issue: "User needs to log in again"
+
+**After**: Only "Token expired" warning
+- Developer thinks: "User's session expired (normal)"
+- Correct diagnosis immediately
+
+**Good logging helps debugging, bad logging creates red herrings.**
+
+## Future Improvements
+
+### 1. Structured Exception Handling
+
+Could create exception categories:
+```python
+from enum import Enum
+
+class ExceptionCategory(Enum):
+    CONTROL_FLOW = "control_flow"  # Don't log as errors
+    CLIENT_ERROR = "client_error"   # Log at warning level
+    SERVER_ERROR = "server_error"   # Log at error level
+```
+
+### 2. Context Managers for Dependencies
+
+Could use a custom context manager that handles different exception types:
+```python
+@asynccontextmanager
+async def managed_db_session():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except HTTPException:
+            await session.rollback()
+            raise
+        except Exception as e:
+            await session.rollback()
+            logger.error("Database error", error=str(e), exc_info=True)
+            raise
+```
+
+### 3. Exception Middleware
+
+Could add a FastAPI middleware that logs all unhandled exceptions with context:
+```python
+@app.middleware("http")
+async def log_exceptions(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except HTTPException as e:
+        logger.info("HTTP exception", status=e.status_code, detail=e.detail)
+        raise
+    except Exception as e:
+        logger.error("Unhandled exception", path=request.url.path, exc_info=True)
+        raise
+```
+
+### 4. Custom Exception Classes
+
+Could define custom exceptions for different error types:
+```python
+class AuthenticationError(HTTPException):
+    def __init__(self, detail: str):
+        super().__init__(status_code=401, detail=detail)
+
+class DatabaseError(Exception):
+    pass
+```
+
+This makes it clearer what exceptions to catch where.
+
+## Summary
+
+**Problem**: Expired JWT tokens caused misleading "Database session error" logs that made debugging confusing.
+
+**Root Cause**: `get_db()` dependency caught ALL exceptions and logged them as database errors, including HTTPExceptions from authentication.
+
+**Solution**: Separated exception handling in `get_db()` to:
+1. Catch HTTPExceptions separately and re-raise without logging as DB errors
+2. Only log actual database exceptions as "Database session error"
+
+**Impact**:
+- ✅ Cleaner logs (no more misleading database errors)
+- ✅ Easier debugging (correct error messages)
+- ✅ Same behavior (401 responses still work correctly)
+- ✅ Better separation of concerns (auth errors vs DB errors)
+
+**Status**: ✅ Fixed and deployed (API service restarted)
+
+**Testing**: Next expired token request will show clean logs without "Database session error"
+
+---
+
+End of Devlog

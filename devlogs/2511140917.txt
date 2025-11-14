@@ -1,0 +1,577 @@
+# Devlog: Post-Migration Fixes - user_id References and Supabase Admin Permissions
+Date: 2025-11-14 09:17 (Local)
+Session Type: Bug Fix
+Status: ✅ FIXED
+
+## Session Overview
+
+Fixed critical bugs that remained after the Supabase-only user management migration (see devlog 2511140906.txt). The migration successfully removed the local users table and switched to Supabase-only storage, but some code still referenced the old `user.user_id` attribute instead of `user.supabase_user_id`, and the onboarding endpoint was using the wrong Supabase client (lacking admin permissions).
+
+### Files Modified
+- `api/app/video/routes.py` - Fixed all 9 occurrences of `user.user_id` → `user.supabase_user_id`
+- `api/app/auth/supabase.py` - Added `get_admin_supabase()` dependency
+- `api/app/auth/routes.py` - Updated onboarding endpoint to use admin client
+
+## Problem Statement
+
+### Issue 1: AttributeError in Video Routes
+**Error Message**:
+```
+AttributeError: 'AuthUser' object has no attribute 'user_id'
+  File "/app/app/video/routes.py", line 272, in list_videos
+    count_stmt = select(sql_func.count(Video.video_id)).where(Video.user_id == UUID(user.user_id))
+                                                                                    ^^^^^^^^^^^^
+```
+
+**Root Cause**: The migration to Supabase-only user management (devlog 2511140906.txt) changed the `AuthUser` class to only have `supabase_user_id` (not `user_id`), but the video routes still referenced `user.user_id`.
+
+**Affected Endpoints**:
+- POST /videos/upload/init
+- POST /videos/upload/complete
+- GET /videos
+- GET /videos/{video_id}
+- GET /videos/{video_id}/status
+
+**Occurrences**:
+```python
+# api/app/video/routes.py (9 occurrences)
+Line 111: storage_key = f"videos/{user.user_id}/{video_id}.{file_extension}"  # ❌
+Line 116: user_id=UUID(user.user_id),  # ❌
+Line 139: user_id=user.user_id,  # ❌
+Line 176: Video.user_id == UUID(user.user_id),  # ❌
+Line 209: user_id=user.user_id,  # ❌
+Line 272: count_stmt = select(sql_func.count(Video.video_id)).where(Video.user_id == UUID(user.user_id))  # ❌
+Line 280: .where(Video.user_id == UUID(user.user_id))  # ❌
+Line 367: Video.user_id == UUID(user.user_id),  # ❌
+Line 433: Video.user_id == UUID(user.user_id),  # ❌
+```
+
+### Issue 2: Supabase 403 Forbidden in Onboarding
+**Error Message**:
+```
+HTTP Request: PUT https://jtldqrccffoypvsjzpej.supabase.co/auth/v1/admin/users/f5815928-176f-4a1a-85e2-3b86e5c11998 "HTTP/2 403 Forbidden"
+
+{"error": "User not allowed", "user_id": "f5815928-176f-4a1a-85e2-3b86e5c11998", "event": "Onboarding failed", "level": "error"}
+{"path": "/auth/onboarding", "status_code": 500, "detail": "Failed to complete onboarding"}
+```
+
+**Root Cause**: The onboarding endpoint was using `get_supabase()` dependency which returns a Supabase client authenticated with the **anon key**, but then calling `supabase.auth.admin.update_user_by_id()` which requires the **service role key** (admin privileges).
+
+**Code Analysis**:
+```python
+# api/app/auth/routes.py (BEFORE)
+@router.post("/onboarding", response_model=UserResponse)
+async def complete_onboarding(
+    request: OnboardingRequest,
+    current_user: AuthUser = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),  # ❌ Uses anon key
+):
+    # This requires admin privileges!
+    supabase.auth.admin.update_user_by_id(  # ❌ 403 Forbidden
+        current_user.supabase_user_id,
+        {"user_metadata": {...}}
+    )
+```
+
+**Supabase Client Types**:
+- `get_supabase()` → Uses `SUPABASE_KEY` (anon key) → Regular user operations
+- `get_admin_supabase()` (missing) → Should use `SUPABASE_SERVICE_ROLE_KEY` → Admin operations
+
+**Why it failed**:
+The Supabase Admin API (`/auth/v1/admin/users/*`) requires authentication with the **service role key**, not the anon key. The anon key is only for client-side operations (sign up, sign in, etc.).
+
+## Root Cause Analysis
+
+### Migration Incomplete
+The Supabase-only migration (devlog 2511140906.txt) successfully:
+- ✅ Removed the local `users` table
+- ✅ Updated `AuthUser` class to only have `supabase_user_id`
+- ✅ Updated auth routes (login, register, /me)
+- ✅ Updated people routes
+- ✅ Updated search routes
+
+But missed:
+- ❌ Video routes (still used `user.user_id`)
+- ❌ Admin Supabase client dependency (not created)
+- ❌ Onboarding endpoint (used wrong client)
+
+### Why These Were Missed
+**Video routes**: The migration devlog (2511140906.txt) stated "Updated Routes" and listed `api/app/people/routes.py` and `api/app/search/routes.py`, but didn't explicitly mention `api/app/video/routes.py`.
+
+**Admin client**: The migration devlog mentioned that `supabase.auth.admin.update_user_by_id()` should be used, but didn't note that this requires a separate admin client dependency.
+
+## Solutions Implemented
+
+### Solution 1: Fix Video Routes
+
+Changed all 9 occurrences of `user.user_id` to `user.supabase_user_id`:
+
+**File**: `api/app/video/routes.py`
+
+```python
+# BEFORE (Lines 108-116)
+storage_key = f"videos/{user.user_id}/{video_id}.{file_extension}"  # ❌
+
+video = Video(
+    video_id=video_id,
+    user_id=UUID(user.user_id),  # ❌
+    storage_key=storage_key,
+    # ...
+)
+
+# AFTER
+storage_key = f"videos/{user.supabase_user_id}/{video_id}.{file_extension}"  # ✅
+
+video = Video(
+    video_id=video_id,
+    user_id=UUID(user.supabase_user_id),  # ✅
+    storage_key=storage_key,
+    # ...
+)
+```
+
+**All Changes**:
+1. Line 111: Storage key path generation
+2. Line 116: Video record creation (`user_id` column)
+3. Line 139: Logger statement
+4. Line 176: Upload completion query filter
+5. Line 209: Logger statement
+6. Line 272: List videos count query filter
+7. Line 280: List videos main query filter
+8. Line 367: Get video by ID query filter
+9. Line 433: Get video status query filter
+
+### Solution 2: Add Admin Supabase Dependency
+
+Created a new dependency function for admin operations:
+
+**File**: `api/app/auth/supabase.py`
+
+```python
+# ADDED (Lines 74-80)
+def get_admin_supabase() -> Client:
+    """Dependency injection helper for admin operations in FastAPI routes.
+
+    Returns:
+        Supabase client instance with admin privileges (service role key)
+    """
+    return SupabaseClient.get_admin_client()
+```
+
+**How it works**:
+```python
+class SupabaseClient:
+    @classmethod
+    def get_admin_client(cls) -> Client:
+        """Get Supabase client with admin privileges."""
+        if not settings.supabase_service_role_key:  # Validation
+            raise ValueError("SUPABASE_SERVICE_ROLE_KEY not configured")
+
+        return create_client(
+            supabase_url=settings.supabase_url,
+            supabase_key=settings.supabase_service_role_key,  # ✅ Service role key
+        )
+```
+
+**Environment Variable**:
+`.env.local` already has:
+```bash
+SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+### Solution 3: Update Onboarding Endpoint
+
+Changed the onboarding endpoint to use the admin client:
+
+**File**: `api/app/auth/routes.py`
+
+```python
+# BEFORE
+from app.auth.supabase import get_supabase  # ❌ Only imports regular client
+
+@router.post("/onboarding", response_model=UserResponse)
+async def complete_onboarding(
+    request: OnboardingRequest,
+    current_user: AuthUser = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),  # ❌ Anon key
+):
+    supabase.auth.admin.update_user_by_id(...)  # ❌ 403 Forbidden
+```
+
+```python
+# AFTER
+from app.auth.supabase import get_supabase, get_admin_supabase  # ✅ Both clients
+
+@router.post("/onboarding", response_model=UserResponse)
+async def complete_onboarding(
+    request: OnboardingRequest,
+    current_user: AuthUser = Depends(get_current_user),
+    supabase: Client = Depends(get_admin_supabase),  # ✅ Service role key
+):
+    supabase.auth.admin.update_user_by_id(...)  # ✅ Authorized
+```
+
+**One-line change**: `Depends(get_supabase)` → `Depends(get_admin_supabase)`
+
+## Testing & Verification
+
+### 1. Code Verification
+
+```bash
+# Verify no more user.user_id references
+$ grep -n "user\.user_id" api/app/video/routes.py
+# (no output - all fixed) ✅
+
+# Verify service restarted
+$ docker compose ps api
+NAME          STATUS
+heimdex-api   Up 13 seconds (healthy) ✅
+
+# Verify logs show no errors
+$ docker compose logs --tail=30 api | grep ERROR
+# (no errors) ✅
+```
+
+### 2. Expected Behavior
+
+**Video Upload** (POST /videos/upload/init):
+- **Before**: ❌ `AttributeError: 'AuthUser' object has no attribute 'user_id'`
+- **After**: ✅ Creates video record with `user_id = current_user.supabase_user_id`
+
+**Video Listing** (GET /videos):
+- **Before**: ❌ `AttributeError: 'AuthUser' object has no attribute 'user_id'`
+- **After**: ✅ Returns videos filtered by `Video.user_id == current_user.supabase_user_id`
+
+**User Onboarding** (POST /auth/onboarding):
+- **Before**: ❌ `HTTP 403 Forbidden` - "User not allowed"
+- **After**: ✅ Updates Supabase user_metadata with admin privileges
+
+### 3. Service Status
+
+```bash
+$ docker compose ps
+NAME                STATUS              PORTS
+heimdex-api         Up (healthy)        0.0.0.0:8000->8000/tcp
+heimdex-worker      running
+heimdex-web         running             0.0.0.0:3000->3000/tcp
+heimdex-db          Up (healthy)        0.0.0.0:5432->5432/tcp
+heimdex-redis       Up (healthy)        0.0.0.0:6379->6379/tcp
+heimdex-minio       Up (healthy)        0.0.0.0:9000-9001->9000-9001/tcp
+```
+
+**Status**: ✅ All services running and healthy
+
+## Lessons Learned
+
+### 1. Migration Checklists Are Critical
+
+**Problem**: After a major refactoring (removing `user_id` field), some code paths were missed.
+
+**Solution**: Create exhaustive search checklists for migrations:
+```bash
+# Example migration checklist
+1. Grep for all occurrences: grep -r "user\.user_id" api/
+2. Check each file individually
+3. Run tests after migration
+4. Monitor logs for AttributeError
+5. Document what was changed AND what was verified
+```
+
+**Better Migration Workflow**:
+1. **Before**: Grep for all references to old field/method
+2. **During**: Update each occurrence and mark as complete
+3. **After**: Grep again to verify 0 remaining references
+4. **Test**: Run integration tests
+5. **Monitor**: Check logs for errors
+
+### 2. Supabase Client Types Must Be Explicit
+
+**Problem**: Used wrong Supabase client for admin operations, causing 403 errors.
+
+**Root Cause**: Not understanding the difference between anon key and service role key.
+
+**Supabase Key Types**:
+
+| Key Type | Environment Variable | Usage | Permissions |
+|----------|---------------------|-------|-------------|
+| **Anon Key** | `SUPABASE_KEY` | Client-side operations | Sign up, sign in, user data read |
+| **Service Role Key** | `SUPABASE_SERVICE_ROLE_KEY` | Server-side admin operations | User management, metadata updates |
+
+**When to use which**:
+```python
+# Use get_supabase() (anon key) for:
+- supabase.auth.sign_up()
+- supabase.auth.sign_in_with_password()
+- supabase.auth.sign_out()
+- Reading user's own data
+
+# Use get_admin_supabase() (service role key) for:
+- supabase.auth.admin.update_user_by_id()  # ✅ Required
+- supabase.auth.admin.delete_user()
+- supabase.auth.admin.list_users()
+- Modifying other users' metadata
+```
+
+**Best Practice**: Create separate dependency functions for clarity:
+```python
+def get_supabase() -> Client:  # For regular operations
+    return SupabaseClient.get_client()
+
+def get_admin_supabase() -> Client:  # For admin operations
+    return SupabaseClient.get_admin_client()
+```
+
+### 3. Error Messages Can Be Misleading
+
+**Error**: "User not allowed" (403 Forbidden)
+
+**What it sounds like**: The user doesn't have permission to update their own profile
+
+**What it actually means**: The **API client** (not the user) doesn't have admin privileges
+
+**Debugging approach**:
+1. Check Supabase docs for the endpoint being called
+2. Verify which key type is required (anon vs service role)
+3. Check which key is being used in the code
+4. Ensure environment variable is set correctly
+
+### 4. Dependency Injection for Service Configuration
+
+**Pattern**: Use FastAPI dependency injection to provide different client configurations:
+
+```python
+# Good: Explicit dependencies
+@router.post("/onboarding")
+async def complete_onboarding(
+    supabase: Client = Depends(get_admin_supabase),  # ✅ Explicit admin client
+):
+    await supabase.auth.admin.update_user_by_id(...)
+
+# Bad: Implicit or mixed clients
+@router.post("/onboarding")
+async def complete_onboarding(
+    supabase: Client = Depends(get_supabase),  # ❌ Wrong client for admin operations
+):
+    await supabase.auth.admin.update_user_by_id(...)  # 403 error
+```
+
+**Benefits**:
+- Clear intent (admin vs regular operations)
+- Easy to test (mock different clients)
+- Type-safe (FastAPI validates dependencies)
+- Self-documenting (function signature shows requirements)
+
+### 5. Grep is Your Best Friend for Refactoring
+
+**Commands used**:
+```bash
+# Find all occurrences
+grep -r "user\.user_id" api/
+
+# Find with line numbers
+grep -n "user\.user_id" api/app/video/routes.py
+
+# Find with context
+grep -A 5 -B 5 "user\.user_id" api/app/video/routes.py
+
+# Count occurrences
+grep -c "user\.user_id" api/app/video/routes.py
+
+# Verify all fixed
+grep -r "user\.user_id" api/  # Should return nothing after fix
+```
+
+**Refactoring workflow**:
+1. `grep -r "old_pattern" .` → Find all occurrences
+2. Edit each file
+3. `grep -r "old_pattern" .` → Verify 0 remaining
+4. Run tests
+5. Commit with descriptive message
+
+### 6. Service Role Key Security
+
+**Important**: The service role key has **full admin access** to Supabase.
+
+**Security practices**:
+- ✅ Store in `.env.local` (not committed to git)
+- ✅ Only use server-side (never expose to frontend)
+- ✅ Use separate dependency (`get_admin_supabase`) to make it explicit
+- ✅ Add validation (check key exists before using)
+- ❌ Never log the service role key
+- ❌ Never send to client
+- ❌ Never commit to repository
+
+**Example validation**:
+```python
+@classmethod
+def get_admin_client(cls) -> Client:
+    if not settings.supabase_service_role_key:
+        raise ValueError(
+            "SUPABASE_SERVICE_ROLE_KEY not configured. "
+            "Required for admin operations."
+        )
+    # ...
+```
+
+## Future Improvements
+
+### 1. Automated Migration Verification
+
+Add a script to verify migrations are complete:
+
+```python
+# scripts/verify_migration.py
+def verify_no_user_id_references():
+    """Verify no code references user.user_id after migration."""
+    result = subprocess.run(
+        ["grep", "-r", "user\\.user_id", "api/"],
+        capture_output=True
+    )
+
+    if result.stdout:
+        raise Exception(f"Found user.user_id references:\n{result.stdout.decode()}")
+
+    print("✅ No user.user_id references found")
+
+# Run as part of CI/CD
+if __name__ == "__main__":
+    verify_no_user_id_references()
+```
+
+### 2. Integration Tests for Admin Operations
+
+Add tests to ensure admin client is used correctly:
+
+```python
+# tests/test_onboarding.py
+async def test_onboarding_uses_admin_client():
+    """Ensure onboarding endpoint uses admin Supabase client."""
+    # Mock the admin client
+    mock_admin_client = Mock()
+
+    # Make request
+    response = await client.post("/auth/onboarding", json={
+        "industry": "Entertainment",
+        "job_title": "Editor",
+        "email_consent": True,
+    })
+
+    # Verify admin client was used
+    mock_admin_client.auth.admin.update_user_by_id.assert_called_once()
+
+    assert response.status_code == 200
+```
+
+### 3. Type Hints for Supabase Clients
+
+Add explicit type hints to distinguish client types:
+
+```python
+from typing import NewType
+
+AnonymousSupabaseClient = NewType("AnonymousSupabaseClient", Client)
+AdminSupabaseClient = NewType("AdminSupabaseClient", Client)
+
+def get_supabase() -> AnonymousSupabaseClient:
+    return SupabaseClient.get_client()
+
+def get_admin_supabase() -> AdminSupabaseClient:
+    return SupabaseClient.get_admin_client()
+
+# Usage
+@router.post("/onboarding")
+async def complete_onboarding(
+    supabase: AdminSupabaseClient = Depends(get_admin_supabase),  # ✅ Clear
+):
+    ...
+```
+
+### 4. Centralized Constants
+
+Define field name constants to prevent typos:
+
+```python
+# app/constants.py
+class UserFields:
+    SUPABASE_USER_ID = "supabase_user_id"
+    EMAIL = "email"
+    DISPLAY_NAME = "display_name"
+
+# Usage
+user_id = getattr(user, UserFields.SUPABASE_USER_ID)  # ✅ IDE autocomplete
+```
+
+### 5. Pre-commit Hooks
+
+Add pre-commit hook to catch common migration issues:
+
+```bash
+# .git/hooks/pre-commit
+#!/bin/bash
+
+# Check for user.user_id references
+if git diff --cached | grep -q "user\.user_id"; then
+    echo "Error: Found user.user_id reference (should be user.supabase_user_id)"
+    exit 1
+fi
+
+# Check for admin operations without admin client
+if git diff --cached | grep -q "auth\.admin\." && ! git diff --cached | grep -q "get_admin_supabase"; then
+    echo "Warning: Found admin operation - ensure using get_admin_supabase()"
+fi
+```
+
+## Summary
+
+### Issues Fixed
+
+1. ✅ **AttributeError in Video Routes**
+   - Changed all 9 occurrences of `user.user_id` → `user.supabase_user_id`
+   - Affects: upload init, upload complete, list videos, get video, get status
+
+2. ✅ **Supabase 403 Forbidden in Onboarding**
+   - Added `get_admin_supabase()` dependency for admin operations
+   - Updated onboarding endpoint to use admin client (service role key)
+
+### Files Modified
+
+- `api/app/video/routes.py` - 9 changes (all `user.user_id` references)
+- `api/app/auth/supabase.py` - Added `get_admin_supabase()` function
+- `api/app/auth/routes.py` - Updated onboarding dependency
+
+### Impact
+
+**Before**:
+- ❌ Video uploads failed with `AttributeError`
+- ❌ User onboarding failed with `403 Forbidden`
+- ❌ Users unable to complete account setup
+
+**After**:
+- ✅ Video uploads work correctly
+- ✅ User onboarding saves to Supabase
+- ✅ All video operations filter by correct user_id
+- ✅ Admin operations use correct service role key
+
+### Root Cause
+
+Incomplete migration from dual-storage (PostgreSQL + Supabase) to Supabase-only. The migration removed the `user_id` attribute from `AuthUser` but didn't update all code paths that referenced it, and didn't set up proper admin client dependency for Supabase admin operations.
+
+### Prevention
+
+1. Use grep to find ALL references before refactoring
+2. Create explicit dependencies for different service configurations
+3. Run integration tests after migrations
+4. Document what was changed AND what was verified
+5. Monitor logs after deployment
+
+---
+
+**Status**: ✅ All issues fixed, services running normally
+
+**Next Steps**: Monitor logs for any remaining issues, add integration tests
+
+**Related Devlogs**:
+- `2511140906.txt` - Supabase-only migration (where these issues originated)
+- `2511140130.txt` - User onboarding implementation (context for onboarding endpoint)
+
+End of Devlog

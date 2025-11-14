@@ -5,6 +5,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { Input } from '@/components/ui/Input';
 import { Button } from '@/components/ui/Button';
+import { compressImage } from '@/lib/utils';
 
 export default function ProfilePage() {
   const queryClient = useQueryClient();
@@ -12,17 +13,18 @@ export default function ProfilePage() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState('');
   const [error, setError] = useState('');
+  const [isCompressing, setIsCompressing] = useState(false);
 
   const { data: people, isLoading } = useQuery({
     queryKey: ['people'],
-    queryFn: () => api.getPeople(),
+    queryFn: () => api.listPeople(),
   });
 
   const createPersonMutation = useMutation({
     mutationFn: async () => {
       const person = await api.createPerson({ name });
       if (selectedFile) {
-        await api.uploadPersonPhoto(person.id, selectedFile);
+        await api.uploadPersonPhoto(person.person_id, selectedFile);
       }
       return person;
     },
@@ -38,20 +40,30 @@ export default function ProfilePage() {
     },
   });
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      if (file.size > 5 * 1024 * 1024) {
-        setError('Image must be less than 5MB');
-        return;
-      }
-      setSelectedFile(file);
+    if (!file) return;
+
+    try {
+      setIsCompressing(true);
+      setError('');
+
+      // Automatically compress if larger than 5MB
+      const processedFile = await compressImage(file, 5, 0.8);
+
+      setSelectedFile(processedFile);
+
+      // Generate preview
       const reader = new FileReader();
       reader.onloadend = () => {
         setPreviewUrl(reader.result as string);
       };
-      reader.readAsDataURL(file);
-      setError('');
+      reader.readAsDataURL(processedFile);
+    } catch (err) {
+      setError('Failed to process image. Please try another file.');
+      console.error('Image compression error:', err);
+    } finally {
+      setIsCompressing(false);
     }
   };
 
@@ -96,7 +108,11 @@ export default function ProfilePage() {
               Profile Photo (optional)
             </label>
             <div className="flex items-center space-x-4">
-              {previewUrl ? (
+              {isCompressing ? (
+                <div className="w-24 h-24 bg-gray-100 rounded-lg flex items-center justify-center">
+                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
+                </div>
+              ) : previewUrl ? (
                 <div className="relative">
                   <img
                     src={previewUrl}
@@ -144,7 +160,7 @@ export default function ProfilePage() {
               </label>
             </div>
             <p className="mt-2 text-xs text-gray-500">
-              Upload a clear photo of the person's face for best results
+              Upload a clear photo of the person's face for best results. Large images will be automatically compressed.
             </p>
           </div>
 
@@ -164,27 +180,21 @@ export default function ProfilePage() {
         ) : people && people.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {people.map((person) => (
-              <div key={person.id} className="flex items-center space-x-3 p-3 border border-gray-200 rounded-lg">
-                {person.photo_url ? (
-                  <img
-                    src={person.photo_url}
-                    alt={person.name}
-                    className="w-12 h-12 rounded-full object-cover"
-                  />
-                ) : (
-                  <div className="w-12 h-12 bg-gray-200 rounded-full flex items-center justify-center">
-                    <svg className="w-6 h-6 text-gray-400" fill="currentColor" viewBox="0 0 20 20">
-                      <path
-                        fillRule="evenodd"
-                        d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z"
-                        clipRule="evenodd"
-                      />
-                    </svg>
-                  </div>
-                )}
+              <div key={person.person_id} className="flex items-center space-x-3 p-3 border border-gray-200 rounded-lg">
+                <div className="w-12 h-12 bg-gray-200 rounded-full flex items-center justify-center">
+                  <svg className="w-6 h-6 text-gray-400" fill="currentColor" viewBox="0 0 20 20">
+                    <path
+                      fillRule="evenodd"
+                      d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                </div>
                 <div className="flex-1">
                   <p className="font-medium text-gray-900">{person.name}</p>
-                  <p className="text-xs text-gray-500">Enrolled</p>
+                  <p className="text-xs text-gray-500">
+                    {person.photo_count > 0 ? `${person.photo_count} photo${person.photo_count > 1 ? 's' : ''}` : 'No photos yet'}
+                  </p>
                 </div>
               </div>
             ))}

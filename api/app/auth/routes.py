@@ -1,14 +1,16 @@
-"""Authentication routes using Supabase."""
+"""Authentication routes using Supabase.
+
+All user data is stored in Supabase user_metadata and app_metadata.
+No local database storage for user profiles.
+"""
 
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
 from supabase import Client
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.supabase import get_supabase
+from app.auth.supabase import get_supabase, get_admin_supabase
 from app.auth.middleware import get_current_user, AuthUser
-from app.db import get_db
 from app.logging_config import logger
 
 router = APIRouter()
@@ -71,7 +73,19 @@ class UserResponse(BaseModel):
     email: str
     email_verified: bool
     display_name: Optional[str] = None
+    onboarding_completed: bool = False
+    industry: Optional[str] = None
+    job_title: Optional[str] = None
+    email_consent: bool = False
     created_at: str
+
+
+class OnboardingRequest(BaseModel):
+    """User onboarding request."""
+
+    industry: str = Field(..., max_length=100)
+    job_title: str = Field(..., max_length=100)
+    email_consent: bool
 
 
 class MessageResponse(BaseModel):
@@ -86,6 +100,8 @@ async def register(
     supabase: Client = Depends(get_supabase),
 ):
     """Register a new user with email and password.
+
+    All user data is stored in Supabase user_metadata.
 
     Args:
         request: Registration request with email and password
@@ -105,6 +121,7 @@ async def register(
             "options": {
                 "data": {
                     "display_name": request.display_name,
+                    "onboarding_completed": False,
                 }
             }
         })
@@ -139,7 +156,10 @@ async def register(
                 }
             )
 
-        # Return tokens and user info (only if email confirmation is disabled)
+        # Extract user data from Supabase response
+        user_metadata = response.user.user_metadata or {}
+
+        # Return tokens and user info
         return AuthResponse(
             access_token=response.session.access_token,
             token_type="bearer",
@@ -149,7 +169,12 @@ async def register(
                 "id": response.user.id,
                 "email": response.user.email,
                 "email_verified": response.user.email_confirmed_at is not None,
-                "display_name": request.display_name,
+                "display_name": user_metadata.get("display_name"),
+                "onboarding_completed": user_metadata.get("onboarding_completed", False),
+                "industry": user_metadata.get("industry"),
+                "job_title": user_metadata.get("job_title"),
+                "email_consent": user_metadata.get("email_consent", False),
+                "created_at": response.user.created_at,
             },
         )
 
@@ -167,6 +192,8 @@ async def login(
     supabase: Client = Depends(get_supabase),
 ):
     """Login with email and password.
+
+    All user data is retrieved from Supabase.
 
     Args:
         request: Login request with email and password
@@ -191,10 +218,14 @@ async def login(
                 detail="Invalid credentials",
             )
 
+        # Extract user data from Supabase response
+        user_metadata = response.user.user_metadata or {}
+
         logger.info(
             "User logged in successfully",
             user_id=response.user.id,
             email=request.email,
+            onboarding_completed=user_metadata.get("onboarding_completed", False),
         )
 
         return AuthResponse(
@@ -206,6 +237,12 @@ async def login(
                 "id": response.user.id,
                 "email": response.user.email,
                 "email_verified": response.user.email_confirmed_at is not None,
+                "display_name": user_metadata.get("display_name"),
+                "onboarding_completed": user_metadata.get("onboarding_completed", False),
+                "industry": user_metadata.get("industry"),
+                "job_title": user_metadata.get("job_title"),
+                "email_consent": user_metadata.get("email_consent", False),
+                "created_at": response.user.created_at,
             },
         )
 
@@ -250,6 +287,8 @@ async def refresh_token(
 ):
     """Refresh access token using refresh token.
 
+    All user data is retrieved from Supabase.
+
     Args:
         request: Refresh token request
         supabase: Supabase client
@@ -263,11 +302,14 @@ async def refresh_token(
     try:
         response = supabase.auth.refresh_session(request.refresh_token)
 
-        if not response.session:
+        if not response.session or not response.user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid refresh token",
             )
+
+        # Extract user data from Supabase response
+        user_metadata = response.user.user_metadata or {}
 
         return AuthResponse(
             access_token=response.session.access_token,
@@ -278,7 +320,13 @@ async def refresh_token(
                 "id": response.user.id,
                 "email": response.user.email,
                 "email_verified": response.user.email_confirmed_at is not None,
-            } if response.user else {},
+                "display_name": user_metadata.get("display_name"),
+                "onboarding_completed": user_metadata.get("onboarding_completed", False),
+                "industry": user_metadata.get("industry"),
+                "job_title": user_metadata.get("job_title"),
+                "email_consent": user_metadata.get("email_consent", False),
+                "created_at": response.user.created_at,
+            },
         )
 
     except Exception as e:
@@ -380,59 +428,105 @@ async def send_magic_link(
         return MessageResponse(message="Magic link sent to your email")
 
 
-@router.get("/me", response_model=UserResponse)
-async def get_current_user_profile(
+@router.post("/onboarding", response_model=UserResponse)
+async def complete_onboarding(
+    request: OnboardingRequest,
     current_user: AuthUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    supabase: Client = Depends(get_admin_supabase),
 ):
-    """Get current user profile.
+    """Complete user onboarding.
+
+    All onboarding data is saved directly to Supabase user_metadata.
 
     Args:
+        request: Onboarding data
         current_user: Current authenticated user
-        db: Database session
+        supabase: Supabase client
 
     Returns:
-        User profile
+        Updated user profile
 
     Raises:
-        HTTPException: If user not found
+        HTTPException: If update fails
     """
     try:
-        # Query the local database for the full user record
-        from sqlalchemy import select
-        from app.models.user import User
-        from uuid import UUID
+        from datetime import datetime
 
-        stmt = select(User).where(User.supabase_user_id == UUID(current_user.supabase_user_id))
-        result = await db.execute(stmt)
-        user = result.scalar_one_or_none()
+        # Save onboarding data to Supabase user_metadata using Admin API
+        supabase.auth.admin.update_user_by_id(
+            current_user.supabase_user_id,
+            {
+                "user_metadata": {
+                    "industry": request.industry,
+                    "job_title": request.job_title,
+                    "email_consent": request.email_consent,
+                    "onboarding_completed": True,
+                    "display_name": current_user.display_name,  # Preserve existing display_name
+                }
+            }
+        )
 
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found",
-            )
+        logger.info(
+            "User onboarding completed",
+            user_id=current_user.supabase_user_id,
+            industry=request.industry,
+            job_title=request.job_title,
+            email_consent=request.email_consent,
+        )
 
         return UserResponse(
             id=current_user.supabase_user_id,
-            email=user.email,
-            email_verified=user.email_verified,
-            display_name=user.display_name,
-            created_at=user.created_at.isoformat(),
+            email=current_user.email,
+            email_verified=current_user.email_verified,
+            display_name=current_user.display_name,
+            onboarding_completed=True,
+            industry=request.industry,
+            job_title=request.job_title,
+            email_consent=request.email_consent,
+            created_at=datetime.utcnow().isoformat(),  # Approximate, since we don't have exact created_at
         )
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(
-            "Failed to get user profile",
+            "Onboarding failed",
             error=str(e),
             user_id=current_user.supabase_user_id,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve user profile",
+            detail="Failed to complete onboarding",
         )
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user_profile(
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Get current user profile.
+
+    All user data is retrieved from the JWT token (already extracted by middleware).
+
+    Args:
+        current_user: Current authenticated user (from JWT token)
+
+    Returns:
+        User profile
+    """
+    from datetime import datetime
+
+    return UserResponse(
+        id=current_user.supabase_user_id,
+        email=current_user.email,
+        email_verified=current_user.email_verified,
+        display_name=current_user.display_name,
+        onboarding_completed=current_user.onboarding_completed,
+        industry=current_user.industry,
+        job_title=current_user.job_title,
+        email_consent=current_user.email_consent,
+        created_at=datetime.utcnow().isoformat(),  # Approximate, JWT doesn't include created_at
+    )
 
 
 @router.get("/verify")

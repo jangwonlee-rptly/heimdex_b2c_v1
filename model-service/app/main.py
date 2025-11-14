@@ -272,7 +272,7 @@ class ModelManager:
             model = AutoModel.from_pretrained(
                 model_path,
                 cache_dir=cache_dir,
-                local_files_only=True
+                local_files_only=True,
             )
             model = model.to(self.device)
             model.eval()  # Set to evaluation mode

@@ -69,3 +69,12 @@ def get_supabase() -> Client:
         Supabase client instance
     """
     return SupabaseClient.get_client()
+
+
+def get_admin_supabase() -> Client:
+    """Dependency injection helper for admin operations in FastAPI routes.
+
+    Returns:
+        Supabase client instance with admin privileges (service role key)
+    """
+    return SupabaseClient.get_admin_client()

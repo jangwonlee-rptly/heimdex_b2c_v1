@@ -4,6 +4,10 @@ export interface AuthUser {
   email: string;
   email_verified: boolean;
   display_name?: string;
+  onboarding_completed: boolean;
+  industry?: string;
+  job_title?: string;
+  email_consent: boolean;
   created_at: string;
 }
 
@@ -32,6 +36,12 @@ export interface PasswordResetRequest {
 
 export interface MagicLinkRequest {
   email: string;
+}
+
+export interface OnboardingRequest {
+  industry: string;
+  job_title: string;
+  email_consent: boolean;
 }
 
 export interface MessageResponse {
@@ -114,13 +124,11 @@ export interface SearchResponse {
 
 // Person (profile) types
 export interface Person {
-  id: string;
+  person_id: string;
   user_id: string;
   name: string;
-  photo_url?: string;
-  face_embedding?: number[];
+  photo_count: number;
   created_at: string;
-  updated_at: string;
 }
 
 export interface CreatePersonRequest {

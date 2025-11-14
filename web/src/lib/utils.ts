@@ -173,3 +173,110 @@ export function debounce<T extends (...args: any[]) => any>(
     timeout = setTimeout(() => func.apply(this, args), wait);
   };
 }
+
+/**
+ * Compress an image file to reduce its size
+ *
+ * @param file - Image file to compress
+ * @param maxSizeMB - Maximum size in MB (default: 5)
+ * @param quality - Compression quality 0-1 (default: 0.8)
+ * @returns Compressed image file
+ *
+ * @example
+ * const compressed = await compressImage(largeImageFile)
+ * const highQuality = await compressImage(imageFile, 5, 0.9)
+ */
+export async function compressImage(
+  file: File,
+  maxSizeMB: number = 5,
+  quality: number = 0.8
+): Promise<File> {
+  const maxSizeBytes = maxSizeMB * 1024 * 1024;
+
+  // If file is already small enough, return as is
+  if (file.size <= maxSizeBytes) {
+    return file;
+  }
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = (e) => {
+      const img = new Image();
+
+      img.onload = () => {
+        // Create canvas
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+
+        // Calculate new dimensions if image is very large
+        const maxDimension = 2048;
+        if (width > maxDimension || height > maxDimension) {
+          if (width > height) {
+            height = (height * maxDimension) / width;
+            width = maxDimension;
+          } else {
+            width = (width * maxDimension) / height;
+            height = maxDimension;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+
+        // Draw image on canvas
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('Failed to get canvas context'));
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // Try different quality levels until we get under the size limit
+        let currentQuality = quality;
+        const tryCompress = () => {
+          canvas.toBlob(
+            (blob) => {
+              if (!blob) {
+                reject(new Error('Failed to compress image'));
+                return;
+              }
+
+              // If still too large and quality can be reduced further, try again
+              if (blob.size > maxSizeBytes && currentQuality > 0.1) {
+                currentQuality -= 0.1;
+                tryCompress();
+                return;
+              }
+
+              // Create new File from blob
+              const compressedFile = new File([blob], file.name, {
+                type: 'image/jpeg',
+                lastModified: Date.now(),
+              });
+
+              resolve(compressedFile);
+            },
+            'image/jpeg',
+            currentQuality
+          );
+        };
+
+        tryCompress();
+      };
+
+      img.onerror = () => {
+        reject(new Error('Failed to load image'));
+      };
+
+      img.src = e.target?.result as string;
+    };
+
+    reader.onerror = () => {
+      reject(new Error('Failed to read file'));
+    };
+
+    reader.readAsDataURL(file);
+  });
+}

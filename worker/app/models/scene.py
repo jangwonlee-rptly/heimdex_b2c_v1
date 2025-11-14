@@ -43,7 +43,7 @@ class ScenePerson(Base):
     __tablename__ = "scene_people"
 
     scene_id = Column(PGUUID(as_uuid=True), ForeignKey("scenes.scene_id", ondelete="CASCADE"), nullable=False)
-    person_id = Column(PGUUID(as_uuid=True), ForeignKey("face_profiles.face_profile_id", ondelete="CASCADE"), nullable=False, index=True)
+    person_id = Column(PGUUID(as_uuid=True), ForeignKey("face_profiles.person_id", ondelete="CASCADE"), nullable=False, index=True)
     confidence = Column(Float, nullable=False)
     frame_count = Column(Integer, nullable=False)
 

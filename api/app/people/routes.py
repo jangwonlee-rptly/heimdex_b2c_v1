@@ -53,10 +53,10 @@ async def list_people(
     Returns:
         List of face profiles with metadata
     """
-    logger.info(f"[people] Listing face profiles for user: {current_user.user_id}")
+    logger.info(f"[people] Listing face profiles for user: {current_user.supabase_user_id}")
 
     try:
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
 
         # Query face profiles for user
         query = (
@@ -114,10 +114,10 @@ async def create_person(
     Returns:
         Created face profile
     """
-    logger.info(f"[people] Creating face profile '{person.name}' for user: {current_user.user_id}")
+    logger.info(f"[people] Creating face profile '{person.name}' for user: {current_user.supabase_user_id}")
 
     try:
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
 
         # Check if person with same name already exists
         existing_query = (
@@ -140,7 +140,7 @@ async def create_person(
             user_id=user_uuid,
             name=person.name,
             photo_keys=[],  # Empty initially, photos uploaded separately
-            face_vec=None,  # Will be computed when photos are uploaded
+            adaface_vec=None,  # Will be computed when photos are uploaded
             created_at=datetime.utcnow(),
         )
 
@@ -187,7 +187,7 @@ async def get_person(
     logger.info(f"[people] Getting face profile: {person_id}")
 
     try:
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
         person_uuid = UUID(person_id)
 
         # Query face profile
@@ -242,7 +242,7 @@ async def delete_person(
     logger.info(f"[people] Deleting face profile: {person_id}")
 
     try:
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
         person_uuid = UUID(person_id)
 
         # Query face profile
@@ -322,7 +322,7 @@ async def init_person_photo_upload(
                 detail="Face enrollment is not enabled"
             )
 
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
         person_uuid = UUID(person_id)
 
         # Verify person exists and belongs to user
@@ -352,7 +352,7 @@ async def init_person_photo_upload(
         from datetime import datetime
         timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         extension = "jpg" if "jpeg" in request.content_type else "png"
-        photo_key = f"faces/{current_user.user_id}/{person_id}/photo_{timestamp}.{extension}"
+        photo_key = f"faces/{current_user.supabase_user_id}/{person_id}/photo_{timestamp}.{extension}"
 
         # Generate presigned upload URL
         from app.storage import StorageClient
@@ -404,7 +404,7 @@ async def complete_person_photo_upload(
     to the presigned URL. It will:
     1. Add the photo_key to the person's photo_keys array
     2. Queue a background task to compute face embeddings
-    3. Update the person's face_vec with the averaged embedding
+    3. Update the person's adaface_vec with the averaged embedding
 
     Args:
         person_id: Face profile ID (UUID)
@@ -428,7 +428,7 @@ async def complete_person_photo_upload(
                 detail="Face enrollment is not enabled"
             )
 
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
         person_uuid = UUID(person_id)
 
         # Verify person exists and belongs to user
@@ -447,7 +447,7 @@ async def complete_person_photo_upload(
             )
 
         # Verify photo_key belongs to this person
-        expected_prefix = f"faces/{current_user.user_id}/{person_id}/"
+        expected_prefix = f"faces/{current_user.supabase_user_id}/{person_id}/"
         if not request.photo_key.startswith(expected_prefix):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

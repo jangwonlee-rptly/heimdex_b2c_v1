@@ -97,13 +97,13 @@ async def search(
     - Transcript keyword: 0.2 weight (exact keyword matches)
     - Scores are normalized and combined for final ranking
     """
-    logger.info(f"[search] Comprehensive hybrid query: '{q}', user: {current_user.user_id}")
+    logger.info(f"[search] Comprehensive hybrid query: '{q}', user: {current_user.supabase_user_id}")
 
     # Check if semantic search is available
     semantic_available = settings.feature_semantic_search
 
     try:
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
 
         # Generate query embedding if semantic search is enabled
         query_embedding = None
@@ -513,7 +513,7 @@ async def hybrid_search(
             detail="Semantic search must be enabled for hybrid search. Set FEATURE_SEMANTIC_SEARCH=true."
         )
 
-    logger.info(f"[search] Hybrid query: '{q}', user: {current_user.user_id}")
+    logger.info(f"[search] Hybrid query: '{q}', user: {current_user.supabase_user_id}")
 
     try:
         # Generate query embedding for dense retrieval
@@ -529,7 +529,7 @@ async def hybrid_search(
         embedding_list = query_embedding.tolist()
         embedding_str = str(embedding_list)
 
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
         rrf_k = settings.search_hybrid_rrf_k
         bm25_weight = settings.search_hybrid_bm25_weight
         vector_weight = settings.search_hybrid_vector_weight
@@ -774,7 +774,7 @@ async def semantic_search(
             detail="Semantic search is not enabled. Set FEATURE_SEMANTIC_SEARCH=true to enable."
         )
 
-    logger.info(f"[search] Semantic query: '{q}', user: {current_user.user_id}")
+    logger.info(f"[search] Semantic query: '{q}', user: {current_user.supabase_user_id}")
 
     try:
         # Generate query embedding
@@ -796,7 +796,7 @@ async def semantic_search(
         vision_w = vision_weight if vision_weight is not None else settings.search_vision_weight
         person_boost = settings.search_person_boost
 
-        user_uuid = UUID(current_user.user_id)
+        user_uuid = UUID(current_user.supabase_user_id)
 
         # Apply ANN tuning if enabled (FEATURE_SEARCH_SYS_ANN_TUNING)
         if settings.feature_search_sys_ann_tuning:

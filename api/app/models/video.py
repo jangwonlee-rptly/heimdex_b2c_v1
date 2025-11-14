@@ -3,7 +3,7 @@
 import enum
 from datetime import datetime
 from uuid import UUID
-from sqlalchemy import Column, String, BigInteger, Numeric, Text, Enum, TIMESTAMP, ForeignKey
+from sqlalchemy import Column, String, BigInteger, Numeric, Text, Enum, TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import relationship
 from app.models.base import Base
@@ -25,7 +25,7 @@ class Video(Base):
     __tablename__ = "videos"
 
     video_id = Column(PGUUID(as_uuid=True), primary_key=True, server_default="uuid_generate_v4()")
-    user_id = Column(PGUUID(as_uuid=True), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(PGUUID(as_uuid=True), nullable=False, index=True)  # Supabase user ID (no FK)
     storage_key = Column(String(512), nullable=False)
     mime_type = Column(String(127), nullable=False)
     size_bytes = Column(BigInteger, nullable=False)
@@ -41,7 +41,6 @@ class Video(Base):
     indexed_at = Column(TIMESTAMP(timezone=True), nullable=True)
 
     # Relationships
-    user = relationship("User", back_populates="videos")
     scenes = relationship("Scene", back_populates="video", cascade="all, delete-orphan")
     jobs = relationship("Job", back_populates="video", cascade="all, delete-orphan")
     video_metadata = relationship("VideoMetadata", back_populates="video", uselist=False, cascade="all, delete-orphan")

@@ -1,14 +1,15 @@
-"""Authentication middleware for JWT token verification."""
+"""Authentication middleware for JWT token verification.
+
+All user data is now stored in Supabase. The middleware extracts user information
+directly from the Supabase JWT token without needing a local database lookup.
+"""
 
 import jwt
 from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db import get_db
 from app.logging_config import logger
 
 # Security scheme for extracting Bearer token
@@ -16,19 +17,29 @@ security = HTTPBearer()
 
 
 class AuthUser:
-    """Authenticated user context."""
+    """Authenticated user context extracted from Supabase JWT token."""
 
     def __init__(
         self,
-        user_id: str,
         supabase_user_id: str,
         email: str,
         email_verified: bool = False,
+        display_name: Optional[str] = None,
+        onboarding_completed: bool = False,
+        industry: Optional[str] = None,
+        job_title: Optional[str] = None,
+        email_consent: bool = False,
+        tier: str = "free",
     ):
-        self.user_id = user_id
         self.supabase_user_id = supabase_user_id
         self.email = email
         self.email_verified = email_verified
+        self.display_name = display_name
+        self.onboarding_completed = onboarding_completed
+        self.industry = industry
+        self.job_title = job_title
+        self.email_consent = email_consent
+        self.tier = tier
 
 
 async def verify_token(token: str) -> dict:
@@ -70,13 +81,14 @@ async def verify_token(token: str) -> dict:
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: AsyncSession = Depends(get_db),
 ) -> AuthUser:
     """Get current authenticated user from JWT token.
 
+    All user data is extracted directly from the Supabase JWT token.
+    No local database lookup is needed.
+
     Args:
         credentials: HTTP Bearer credentials
-        db: Database session
 
     Returns:
         Authenticated user context
@@ -100,22 +112,20 @@ async def get_current_user(
             detail="Invalid token: missing user ID",
         )
 
-    # Get or create user in local database
-    from app.auth.user_sync import get_or_create_user
+    # Extract user_metadata from JWT token (includes all profile data)
+    user_metadata = payload.get("user_metadata", {})
+    app_metadata = payload.get("app_metadata", {})
 
-    user = await get_or_create_user(
-        db=db,
+    return AuthUser(
         supabase_user_id=supabase_user_id,
         email=email or "",
         email_verified=email_verified,
-        display_name=payload.get("user_metadata", {}).get("display_name"),
-    )
-
-    return AuthUser(
-        user_id=str(user.user_id),
-        supabase_user_id=supabase_user_id,
-        email=user.email,
-        email_verified=user.email_verified,
+        display_name=user_metadata.get("display_name"),
+        onboarding_completed=user_metadata.get("onboarding_completed", False),
+        industry=user_metadata.get("industry"),
+        job_title=user_metadata.get("job_title"),
+        email_consent=user_metadata.get("email_consent", False),
+        tier=app_metadata.get("tier", "free"),  # Tier in app_metadata for security
     )
 
 
@@ -123,7 +133,6 @@ async def get_current_user_optional(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(
         HTTPBearer(auto_error=False)
     ),
-    db: AsyncSession = Depends(get_db),
 ) -> Optional[AuthUser]:
     """Get current user if authenticated, None otherwise.
 
@@ -131,7 +140,6 @@ async def get_current_user_optional(
 
     Args:
         credentials: Optional HTTP Bearer credentials
-        db: Database session
 
     Returns:
         Authenticated user or None
@@ -140,6 +148,6 @@ async def get_current_user_optional(
         return None
 
     try:
-        return await get_current_user(credentials, db)
+        return await get_current_user(credentials)
     except HTTPException:
         return None

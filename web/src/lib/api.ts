@@ -10,6 +10,7 @@ import type {
   SignInRequest,
   PasswordResetRequest,
   MagicLinkRequest,
+  OnboardingRequest,
   AuthUser,
   MessageResponse,
   VideoUploadInitResponse,
@@ -132,6 +133,11 @@ class APIClient {
     return response.data;
   }
 
+  async completeOnboarding(data: OnboardingRequest): Promise<AuthUser> {
+    const response = await this.client.post<AuthUser>('/auth/onboarding', data);
+    return response.data;
+  }
+
   // ============================================================================
   // VIDEOS
   // ============================================================================
@@ -247,20 +253,24 @@ class APIClient {
     return response.data;
   }
 
-  async uploadPersonPhoto(personId: string, file: File): Promise<Person> {
-    const formData = new FormData();
-    formData.append('photo', file);
-
-    const response = await this.client.post<Person>(
-      `/people/${personId}/photo`,
-      formData,
-      {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      }
+  async uploadPersonPhoto(personId: string, file: File): Promise<void> {
+    // Step 1: Initialize upload and get presigned URL
+    const initResponse = await this.client.post<{ upload_url: string; photo_key: string }>(
+      `/people/${personId}/photos`,
+      { content_type: file.type }
     );
-    return response.data;
+
+    // Step 2: Upload directly to storage using presigned URL
+    await axios.put(initResponse.data.upload_url, file, {
+      headers: {
+        'Content-Type': file.type,
+      },
+    });
+
+    // Step 3: Complete upload to trigger face embedding computation
+    await this.client.post(`/people/${personId}/photos/complete`, {
+      photo_key: initResponse.data.photo_key,
+    });
   }
 }
 

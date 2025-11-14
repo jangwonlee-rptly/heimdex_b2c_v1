@@ -576,6 +576,34 @@ def get_scene_transcript(segments: List[Dict], start_s: float, end_s: float) -> 
     return " ".join(scene_text)
 
 
+def get_video_rotation(video_path: str) -> int:
+    """
+    Get video rotation metadata from video file.
+
+    Args:
+        video_path: Path to video file
+
+    Returns:
+        Rotation angle in degrees (0, 90, 180, 270)
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream_tags=rotate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    try:
+        rotation = int(result.stdout.strip())
+        return rotation
+    except (ValueError, AttributeError):
+        return 0
+
+
 def extract_frame(video_path: str, timestamp: float) -> Image.Image:
     """
     Extract a single frame from video at given timestamp.
@@ -585,7 +613,7 @@ def extract_frame(video_path: str, timestamp: float) -> Image.Image:
         timestamp: Time in seconds
 
     Returns:
-        PIL Image
+        PIL Image (with rotation correction applied)
     """
     cap = cv2.VideoCapture(video_path)
 
@@ -603,7 +631,18 @@ def extract_frame(video_path: str, timestamp: float) -> Image.Image:
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     # Convert to PIL Image
-    return Image.fromarray(frame_rgb)
+    image = Image.fromarray(frame_rgb)
+
+    # Apply rotation correction based on video metadata
+    rotation = get_video_rotation(video_path)
+    if rotation == 90:
+        image = image.rotate(-90, expand=True)
+    elif rotation == 180:
+        image = image.rotate(-180, expand=True)
+    elif rotation == 270:
+        image = image.rotate(-270, expand=True)
+
+    return image
 
 
 def save_thumbnail(frame: Image.Image, video_id: UUID, scene_id: UUID, minio_client) -> str:

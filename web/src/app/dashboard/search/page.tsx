@@ -14,7 +14,7 @@ export default function SearchPage() {
 
   const { data: people } = useQuery({
     queryKey: ['people'],
-    queryFn: () => api.getPeople(),
+    queryFn: () => api.listPeople(),
   });
 
   const {
@@ -72,7 +72,7 @@ export default function SearchPage() {
               >
                 <option value="">All people</option>
                 {people.map((person) => (
-                  <option key={person.id} value={person.id}>
+                  <option key={person.person_id} value={person.person_id}>
                     {person.name}
                   </option>
                 ))}
